@@ -518,13 +518,14 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
         }
 
         int num_prompt_tokens = 0;
-        // 1. Prefix: "User: "
+        // 1. Prefix: "User:"
         prompt_tokens[num_prompt_tokens++] = 12982; // 'User'
         prompt_tokens[num_prompt_tokens++] = 25;    // ':'
-        prompt_tokens[num_prompt_tokens++] = 220;   // ' '
 
-        // 2. User text
-        int n_user = encode_prompt(tok, input_buf, prompt_tokens + num_prompt_tokens, 200);
+        // 2. User text with leading space for exact BPE tokenization
+        char spaced_input[1024];
+        snprintf(spaced_input, sizeof(spaced_input), " %s", input_buf);
+        int n_user = encode_prompt(tok, spaced_input, prompt_tokens + num_prompt_tokens, 200);
         num_prompt_tokens += n_user;
 
         // 3. Suffix: "\n\nKobyakovAI:\n"
@@ -553,7 +554,7 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
 
         for (; generated_count < max_new_tokens && pos < model->config.block_size - 1; pos++, generated_count++) {
             float* logits = forward(model, &state, current_token, pos);
-            current_token = sample_token(logits, model->config.vocab_size, 0.05f, 5, recent_tokens, num_recent, 1.2f);
+            current_token = sample_token(logits, model->config.vocab_size, 0.0f, 0, recent_tokens, num_recent, 1.1f);
 
             // Остановка при маркере конца текста или переходе к User:
             if (current_token == 50256 || current_token == 12982) break;
