@@ -104,8 +104,8 @@ def train_cuda(
             f.write(block.ln1.weight.detach().cpu().numpy().astype("float32").tobytes())
             f.write(block.ln1.bias.detach().cpu().numpy().astype("float32").tobytes())
 
-            wq = torch.cat([h.key.weight for h in block.sa.heads], dim=0)
-            wk = torch.cat([h.query.weight for h in block.sa.heads], dim=0)
+            wq = torch.cat([h.query.weight for h in block.sa.heads], dim=0)
+            wk = torch.cat([h.key.weight for h in block.sa.heads], dim=0)
             wv = torch.cat([h.value.weight for h in block.sa.heads], dim=0)
             wo = block.sa.proj.weight
             f.write(wq.detach().cpu().numpy().astype("float32").tobytes())

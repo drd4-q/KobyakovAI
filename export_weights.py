@@ -92,8 +92,8 @@ def export_model(weights_path="moe_model_weights.pth", output_bin="model.bin"):
             f.write(block.ln1.bias.detach().numpy().astype("float32").tobytes())
 
             # Multi-Head Attention Q, K, V, O
-            wq = torch.cat([h.key.weight for h in block.sa.heads], dim=0) # [n_embd, n_embd]
-            wk = torch.cat([h.query.weight for h in block.sa.heads], dim=0)
+            wq = torch.cat([h.query.weight for h in block.sa.heads], dim=0) # [n_embd, n_embd]
+            wk = torch.cat([h.key.weight for h in block.sa.heads], dim=0)
             wv = torch.cat([h.value.weight for h in block.sa.heads], dim=0)
             wo = block.sa.proj.weight
             f.write(wq.detach().numpy().astype("float32").tobytes())

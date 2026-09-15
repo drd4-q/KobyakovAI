@@ -511,8 +511,17 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
             input_buf[--slen] = '\0';
         }
 
-        if (slen == 0) continue;
-        if (strcmp(input_buf, "exit") == 0 || strcmp(input_buf, "quit") == 0) {
+        // Strip UTF-8 BOM if piped from PowerShell
+        char* clean_input = input_buf;
+        if ((unsigned char)clean_input[0] == 0xEF && 
+            (unsigned char)clean_input[1] == 0xBB && 
+            (unsigned char)clean_input[2] == 0xBF) {
+            clean_input += 3;
+        }
+        while (*clean_input == ' ' || *clean_input == '\t') clean_input++;
+
+        if (strlen(clean_input) == 0) continue;
+        if (strcmp(clean_input, "exit") == 0 || strcmp(clean_input, "quit") == 0) {
             printf("Goodbye!\n");
             break;
         }
@@ -524,7 +533,7 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
 
         // 2. User text with leading space for exact BPE tokenization
         char spaced_input[1024];
-        snprintf(spaced_input, sizeof(spaced_input), " %s", input_buf);
+        snprintf(spaced_input, sizeof(spaced_input), " %s", clean_input);
         int n_user = encode_prompt(tok, spaced_input, prompt_tokens + num_prompt_tokens, 200);
         num_prompt_tokens += n_user;
 
