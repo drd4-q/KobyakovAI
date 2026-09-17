@@ -30,16 +30,21 @@ typedef struct {
 
     // Чат
     char chat_input[512];
-    char chat_history[32768];
+    char chat_history[131072];
     int use_vision;
     int use_web;
     int is_thinking;
 
     // Веб-серфинг
     char web_input[512];
-    char web_results_text[16384];
+    char web_results_text[131072];
     char web_status[256];
     int web_is_loading;
+    int web_page_chars;
+    int web_page_lines;
+    char web_last_urls[4][256];
+    char web_last_titles[4][256];
+    int web_results_count;
 
     // Список окон
     char window_titles[40][128];
@@ -466,6 +471,11 @@ void perform_web_search(AppState* s) {
                     char* e_s = strchr(p_s, '"');
                     if (e_s) { int len = (int)(e_s - p_s); if (len > 1000) len = 1000; strncpy(snippet, p_s, len); }
 
+                    if (item_idx <= 4) {
+                        strncpy(s->web_last_urls[item_idx - 1], url, 255);
+                        strncpy(s->web_last_titles[item_idx - 1], title, 255);
+                    }
+
                     int cl = (int)strlen(clean);
                     snprintf(clean + cl, sizeof(clean) - cl,
                              "[%d] %s\nСсылка: %s\nСуть: %s\n------------------------------------------------------------\n",
@@ -474,9 +484,10 @@ void perform_web_search(AppState* s) {
                 }
                 cur += 9;
             }
+            s->web_results_count = item_idx - 1;
             if (strlen(clean) > 0) {
                 strncpy(s->web_results_text, clean, sizeof(s->web_results_text) - 1);
-                snprintf(s->web_status, sizeof(s->web_status), "✓ Найдено %d релевантных источников в сети.", item_idx - 1);
+                snprintf(s->web_status, sizeof(s->web_status), "✓ Найдено %d релевантных источников в сети. Выберите источник ниже для чтения статьи целиком.", item_idx - 1);
             } else {
                 strcpy(s->web_results_text, "По вашему запросу ничего не найдено.\n");
                 strcpy(s->web_status, "Ничего не найдено.");
@@ -491,28 +502,35 @@ void perform_web_search(AppState* s) {
 void perform_web_fetch(AppState* s) {
     if (strlen(s->web_input) == 0) return;
     s->web_is_loading = 1;
-    strcpy(s->web_status, "🌐 Загрузка и анализ веб-страницы...");
+    strcpy(s->web_status, "🌐 Загрузка и полнотекстовый анализ веб-страницы...");
 
     char req[1024];
     snprintf(req, sizeof(req), "{\"url\": \"%s\"}", s->web_input);
-    char resp[32768];
+    static char resp[262144];
     if (http_post_json("/api/web/fetch", req, resp, sizeof(resp))) {
+        char* p_ch = strstr(resp, "\"chars\":");
+        if (p_ch) s->web_page_chars = atoi(p_ch + 8);
+        char* p_ln = strstr(resp, "\"lines\":");
+        if (p_ln) s->web_page_lines = atoi(p_ln + 8);
+
         char* p_c = strstr(resp, "\"content\":");
         if (p_c) {
             p_c += 10;
             while (*p_c == ' ' || *p_c == '"') p_c++;
             char* end = strrchr(p_c, '"');
             if (end) *end = '\0';
-            char clean[16384];
+            static char clean[131072];
             int ci = 0;
-            for (int i = 0; p_c[i] && ci < 16000; i++) {
+            for (int i = 0; p_c[i] && ci < 131000; i++) {
                 if (p_c[i] == '\\' && p_c[i+1] == 'n') { clean[ci++] = '\n'; i++; }
                 else if (p_c[i] == '\\' && p_c[i+1] == '"') { clean[ci++] = '"'; i++; }
+                else if (p_c[i] == '\\' && p_c[i+1] == '\\') { clean[ci++] = '\\'; i++; }
                 else clean[ci++] = p_c[i];
             }
             clean[ci] = '\0';
             strncpy(s->web_results_text, clean, sizeof(s->web_results_text) - 1);
-            strcpy(s->web_status, "✓ Страница успешно прочитана и очищена от мусора.");
+            snprintf(s->web_status, sizeof(s->web_status), "✓ Страница прочитана полностью (%d символов, %d строк). Сохранено в память.",
+                     s->web_page_chars ? s->web_page_chars : (int)strlen(clean), s->web_page_lines);
         }
     } else {
         strcpy(s->web_status, "Ошибка перехода по ссылке.");
@@ -795,11 +813,15 @@ int main(int argc, char** argv) {
             // ==========================================
             if (g_state.current_tab == 0) {
                 nk_layout_row_begin(ctx, NK_STATIC, 32, 5);
-                nk_layout_row_push(ctx, 150);
-                nk_checkbox_label(ctx, "👁️ Зрение", &g_state.use_vision);
+                nk_layout_row_push(ctx, 165);
+                if (nk_button_label(ctx, g_state.use_vision ? "[✓] 👁 Зрение: ВКЛ" : "[  ] 👁 Зрение: ВЫКЛ")) {
+                    g_state.use_vision = !g_state.use_vision;
+                }
 
-                nk_layout_row_push(ctx, 160);
-                nk_checkbox_label(ctx, "🌐 Веб-поиск", &g_state.use_web);
+                nk_layout_row_push(ctx, 185);
+                if (nk_button_label(ctx, g_state.use_web ? "[✓] 🌐 Веб-поиск: ВКЛ" : "[  ] 🌐 Веб-поиск: ВЫКЛ")) {
+                    g_state.use_web = !g_state.use_web;
+                }
 
                 nk_layout_row_push(ctx, 320);
                 if (g_state.window_count > 0) {
@@ -998,11 +1020,11 @@ int main(int argc, char** argv) {
             }
 
             // ==========================================
-            // ВКЛАДКА 3: КОНТРОЛИРУЕМЫЙ ВЕБ-СЕРФИНГ
+            // ВКЛАДКА 3: КОНТРОЛИРУЕМЫЙ ВЕБ-СЕРФИНГ & ЧТЕНИЕ СТРАНИЦ ЦЕЛИКОМ
             // ==========================================
             else if (g_state.current_tab == 3) {
                 nk_layout_row_dynamic(ctx, 26, 1);
-                nk_label(ctx, "🌐 Контролируемый Веб-серфинг & Поисковый Движок KobyakovAI:", NK_TEXT_LEFT);
+                nk_label(ctx, "🌐 Контролируемый Веб-серфинг & Полнотекстовое Чтение Страниц (KobyakovAI):", NK_TEXT_LEFT);
 
                 // Строка ввода запроса или URL
                 nk_layout_row_begin(ctx, NK_STATIC, 36, 4);
@@ -1019,7 +1041,7 @@ int main(int argc, char** argv) {
                 }
 
                 nk_layout_row_push(ctx, 140);
-                if (nk_button_label(ctx, "🌐 Открыть URL")) {
+                if (nk_button_label(ctx, "📖 Читать URL")) {
                     perform_web_fetch(&g_state);
                 }
 
@@ -1027,21 +1049,43 @@ int main(int argc, char** argv) {
                 if (nk_button_label(ctx, "🗑️ Очистить")) {
                     g_state.web_input[0] = '\0';
                     g_state.web_results_text[0] = '\0';
+                    g_state.web_results_count = 0;
                     strcpy(g_state.web_status, "Очищено.");
                 }
                 nk_layout_row_end(ctx);
 
-                // Статус
+                // Статус и объем
                 nk_layout_row_dynamic(ctx, 22, 1);
                 nk_label(ctx, g_state.web_status, NK_TEXT_LEFT);
 
+                // Если есть найденные источники — отображаем кнопки быстрого открытия страницы целиком
+                int has_quick_links = (g_state.web_results_count > 0);
+                if (has_quick_links) {
+                    int num_btns = g_state.web_results_count;
+                    if (num_btns > 3) num_btns = 3;
+                    nk_layout_row_begin(ctx, NK_STATIC, 30, num_btns + 1);
+                    nk_layout_row_push(ctx, 170);
+                    nk_label(ctx, "📖 Читать полностью:", NK_TEXT_LEFT);
+                    for (int ri = 0; ri < num_btns; ri++) {
+                        char btn_lbl[64];
+                        snprintf(btn_lbl, sizeof(btn_lbl), "Источник %d ↗", ri + 1);
+                        nk_layout_row_push(ctx, 140);
+                        if (nk_button_label(ctx, btn_lbl)) {
+                            strncpy(g_state.web_input, g_state.web_last_urls[ri], sizeof(g_state.web_input) - 1);
+                            perform_web_fetch(&g_state);
+                        }
+                    }
+                    nk_layout_row_end(ctx);
+                }
+
                 // Просмотр найденных фактов / текста страницы
-                nk_layout_row_dynamic(ctx, (float)(win_h - 230), 1);
+                float editor_h = (float)(win_h - (has_quick_links ? 270 : 230));
+                nk_layout_row_dynamic(ctx, editor_h, 1);
                 nk_edit_string_zero_terminated(ctx, NK_EDIT_MULTILINE | NK_EDIT_READ_ONLY, g_state.web_results_text, sizeof(g_state.web_results_text), nk_filter_default);
 
                 // Кнопки взаимодействия
                 nk_layout_row_dynamic(ctx, 38, 2);
-                if (nk_button_label(ctx, "💬 Перенести этот контекст в Чат для обсуждения")) {
+                if (nk_button_label(ctx, "💬 Перенести этот полный текст в Чат для обсуждения")) {
                     send_web_to_chat(&g_state);
                 }
                 if (nk_button_label(ctx, "🧠 Усвоить веб-знания в веса MoE (Обучение)")) {

@@ -27,7 +27,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 from screen_vision import ScreenCapture, ScreenVisionModel
-from web_surfer import WebSurfer
+from web_surfer import WebSurfer, SemanticMeaningSelector
 
 HOST = '127.0.0.1'
 PORT = 8999
@@ -515,90 +515,140 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 visual_summary = v_model.analyze(im, prompt='Кратко опиши содержимое экрана/окна, код, текст и элементы.')
                 visual_context = f'[Визуальный контекст экрана (SmolVLM)]: {visual_summary}\n\n'
 
+            semantic_reasoning_resp = ''
             web_context = ''
-            web_header = ''
-            snippets_text = ''
-            if use_web and user_prompt.strip():
-                print(f"[VisionDaemon] Контролируемый поиск в сети по запросу: «{user_prompt}»...")
-                search_results = web_surfer.search(user_prompt, max_results=3)
+
+            # 1. Проверка прямого URL
+            direct_urls = web_surfer.extract_urls(user_prompt)
+            if direct_urls:
+                target_url = direct_urls[0]
+                print(f"[VisionDaemon] Обнаружен прямой URL: {target_url}. Чтение страницы на 100%...")
+                page_text = web_surfer.fetch_url(target_url, max_chars=None)
+                page_title = web_surfer.last_page_title
+                relevant_blocks = SemanticMeaningSelector.select_relevant_blocks(user_prompt, page_text, top_n=3)
+
+                reasoning_lines = [
+                    f"📖 [Страница прочитана на 100%]: {page_title}",
+                    f"🔗 [URL]: {target_url}",
+                    f"📊 [Объем]: {web_surfer.last_page_chars} символов ({web_surfer.last_page_lines} строк)\n",
+                    "🧠 [Семантический отбор разделов по смыслу]:"
+                ]
+                for bi, b in enumerate(relevant_blocks, 1):
+                    reasoning_lines.append(f"  {bi}. [Раздел: {b['heading']} | Релевантность: {b['score']:.1f}]:")
+                    reasoning_lines.append(f"     {b['text'][:400]}...")
+
+                reasoning_lines.append("\n💭 [Логическое мышление и вывод]:")
+                if relevant_blocks:
+                    reasoning_lines.append(f"По запросу «{user_prompt}» суть найдена в разделе «{relevant_blocks[0]['heading']}»:\n{relevant_blocks[0]['text']}")
+                    if len(relevant_blocks) > 1:
+                        reasoning_lines.append(f"\nДополнительные детали:\n{relevant_blocks[1]['text']}")
+                else:
+                    reasoning_lines.append(page_text[:2000])
+
+                semantic_reasoning_resp = "\n".join(reasoning_lines)
+
+            # 2. Контролируемый веб-поиск и семантический отбор
+            elif use_web and user_prompt.strip():
+                print(f"[VisionDaemon] Контролируемый поиск и смысловой отбор: «{user_prompt}»...")
+                deep_res = web_surfer.search_with_deep_crawl(user_prompt, max_results=3, crawl_top=True)
+                search_results = deep_res.get('results', [])
+                top_text = deep_res.get('top_page_text', '')
+                top_title = deep_res.get('top_page_title', '')
+                relevant_blocks = deep_res.get('relevant_blocks', [])
+
                 if search_results:
                     domains = ", ".join(dict.fromkeys(r.get('domain', 'web') for r in search_results))
-                    web_header = f"🔍 [Поиск в сети]: «{user_prompt}»\n🌐 [Источники]: {domains}\n\n"
-                    snippets_text = "\n".join(f"• {r['snippet']}" for r in search_results)
-                    web_context = f"[Факты из веб-поиска]:\n{snippets_text}\n\n"
-
-            full_prompt = f'{visual_context}{web_context}User: {user_prompt}\n\nKobyakovAI:\n'
-            resp = ""
-
-            # Быстрый инференс в памяти через PyTorch MoE с защитой от повторений и зацикливания
-            bm, b_enc = get_brain_model()
-            if bm is not None and b_enc is not None:
-                try:
-                    import torch
-                    m, dev = bm
-                    input_ids = b_enc.encode(full_prompt)
-                    # Ограничиваем вход окном контекста
-                    x = torch.tensor([input_ids[-100:]], dtype=torch.long, device=dev)
-                    out_tokens = []
-                    max_gen_tokens = 35 if web_header else 55
-                    with torch.no_grad():
-                        for _ in range(max_gen_tokens):
-                            cond_x = x[:, -128:]
-                            with torch.amp.autocast(device_type="cuda", enabled=(dev == "cuda")):
-                                logits, _ = m(cond_x)
-                            cur_logits = logits[0, -1, :].clone()
-
-                            # Штраф за повторение недавних токенов (Repetition Penalty)
-                            for pt in set(out_tokens[-35:]):
-                                if cur_logits[pt] > 0:
-                                    cur_logits[pt] /= 1.4
-                                else:
-                                    cur_logits[pt] *= 1.4
-
-                            # Мягкое сэмплирование (Temperature + Top-k)
-                            probs = torch.softmax(cur_logits / 0.65, dim=-1)
-                            top_k_probs, top_k_idx = torch.topk(probs, 40)
-                            top_k_probs = top_k_probs / torch.sum(top_k_probs)
-                            next_tok = top_k_idx[torch.multinomial(top_k_probs, 1)].item()
-
-                            if next_tok in (50256, 12982):
-                                break
-                            out_tokens.append(next_tok)
-                            x = torch.cat([x, torch.tensor([[next_tok]], device=dev)], dim=1)
-
-                            # Детектор зацикливания (Anti-looping breaker)
-                            if len(out_tokens) >= 8 and out_tokens[-3:] == out_tokens[-6:-3]:
-                                break
-
-                    resp = b_enc.decode(out_tokens).strip()
-                except Exception as e:
-                    print(f"[VisionDaemon] Ошибка ин-мемори инференса: {e}")
-
-            # Если был веб-поиск и есть точные факты: выдаем проверенный структурированный ответ
-            if web_header:
-                resp = f"{web_header}{snippets_text}"
-
-            # Фолбэк на C engine
-            if not resp:
-                try:
-                    proc = subprocess.run(
-                        ['engine_c.exe', 'model.bin', 'tokenizer.bin'],
-                        input=user_prompt.encode('utf-8'),
-                        capture_output=True,
-                        timeout=10
-                    )
-                    raw_out = proc.stdout.decode('utf-8', errors='replace')
-                    if 'KobyakovAI:' in raw_out:
-                        resp = raw_out.split('KobyakovAI:', 1)[-1].strip()
-                        if '[' in resp and 'tok/s' in resp:
-                            resp = resp.split('[Generated')[0].strip()
+                    reasoning_lines = [
+                        f"🔍 [Поиск в сети]: «{user_prompt}»",
+                        f"🌐 [Источники]: {domains}"
+                    ]
+                    if top_title and top_text:
+                        reasoning_lines.append(f"📖 [Первоисточник прочитан полностью]: «{top_title}» ({len(top_text)} символов)\n")
                     else:
-                        resp = raw_out.strip()
-                except Exception:
-                    pass
+                        reasoning_lines.append("")
+
+                    if relevant_blocks:
+                        reasoning_lines.append("🧠 [Семантический отбор по смыслу]:")
+                        for bi, b in enumerate(relevant_blocks, 1):
+                            reasoning_lines.append(f"• [Раздел: {b['heading']} | Смысловой вес: {b['score']:.1f}]:\n  {b['text'][:350]}")
+                        reasoning_lines.append("\n💭 [Логическое мышление и ответ]:")
+                        reasoning_lines.append(f"На основе семантического анализа первоисточника по запросу «{user_prompt}»:")
+                        reasoning_lines.append(relevant_blocks[0]['text'])
+                        if len(relevant_blocks) > 1 and len(relevant_blocks[1]['text']) > 50:
+                            reasoning_lines.append(f"\nСущественные детали:\n{relevant_blocks[1]['text']}")
+                    else:
+                        snippets_text = "\n".join(f"• {r['snippet']}" for r in search_results)
+                        reasoning_lines.append("Факты из проверенных источников:\n" + snippets_text)
+
+                    semantic_reasoning_resp = "\n".join(reasoning_lines)
+
+            # Если сформирован структурированный ответ с семантическим отбором
+            if semantic_reasoning_resp:
+                resp = semantic_reasoning_resp
+            else:
+                # Полноценная генерация MoE без лимитов (до 512 токенов)
+                full_prompt = f"{visual_context}User: {user_prompt}\n\nKobyakovAI:\n"
+                resp = ""
+                bm, b_enc = get_brain_model()
+                if bm is not None and b_enc is not None:
+                    try:
+                        import torch
+                        m, dev = bm
+                        input_ids = b_enc.encode(full_prompt)
+                        x = torch.tensor([input_ids[-100:]], dtype=torch.long, device=dev)
+                        out_tokens = []
+                        max_gen_tokens = 512
+                        with torch.no_grad():
+                            for _ in range(max_gen_tokens):
+                                cond_x = x[:, -128:]
+                                with torch.amp.autocast(device_type="cuda", enabled=(dev == "cuda")):
+                                    logits, _ = m(cond_x)
+                                cur_logits = logits[0, -1, :].clone()
+
+                                for pt in set(out_tokens[-35:]):
+                                    if cur_logits[pt] > 0:
+                                        cur_logits[pt] /= 1.4
+                                    else:
+                                        cur_logits[pt] *= 1.4
+
+                                probs = torch.softmax(cur_logits / 0.65, dim=-1)
+                                top_k_probs, top_k_idx = torch.topk(probs, 40)
+                                top_k_probs = top_k_probs / torch.sum(top_k_probs)
+                                next_tok = top_k_idx[torch.multinomial(top_k_probs, 1)].item()
+
+                                if next_tok in (50256, 12982):
+                                    break
+                                out_tokens.append(next_tok)
+                                x = torch.cat([x, torch.tensor([[next_tok]], device=dev)], dim=1)
+
+                                if len(out_tokens) >= 8 and out_tokens[-3:] == out_tokens[-6:-3]:
+                                    break
+
+                        resp = b_enc.decode(out_tokens).strip()
+                    except Exception as e:
+                        print(f"[VisionDaemon] Ошибка ин-мемори инференса: {e}")
+
+                # Фолбэк на C engine
+                if not resp:
+                    try:
+                        proc = subprocess.run(
+                            ['engine_c.exe', 'model.bin', 'tokenizer.bin'],
+                            input=user_prompt.encode('utf-8'),
+                            capture_output=True,
+                            timeout=10
+                        )
+                        raw_out = proc.stdout.decode('utf-8', errors='replace')
+                        if 'KobyakovAI:' in raw_out:
+                            resp = raw_out.split('KobyakovAI:', 1)[-1].strip()
+                            if '[' in resp and 'tok/s' in resp:
+                                resp = resp.split('[Generated')[0].strip()
+                        else:
+                            resp = raw_out.strip()
+                    except Exception:
+                        pass
 
             if not resp:
-                resp = "..."
+                resp = "..." 
 
             self._send_json({
                 'status': 'ok',
@@ -609,13 +659,32 @@ class DaemonHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/web/search':
             q = req.get('query', '')
             max_res = int(req.get('max_results', 4))
-            results = web_surfer.search(q, max_results=max_res)
-            self._send_json({'status': 'ok', 'query': q, 'results': results})
+            deep = bool(req.get('deep_crawl', False))
+            if deep:
+                deep_res = web_surfer.search_with_deep_crawl(q, max_results=max_res, crawl_top=True)
+                self._send_json({
+                    'status': 'ok',
+                    'query': q,
+                    'results': deep_res['results'],
+                    'top_page_text': deep_res['top_page_text'],
+                    'top_page_title': deep_res['top_page_title'],
+                    'top_page_url': deep_res['top_page_url']
+                })
+            else:
+                results = web_surfer.search(q, max_results=max_res)
+                self._send_json({'status': 'ok', 'query': q, 'results': results})
 
         elif self.path == '/api/web/fetch':
             url = req.get('url', '')
-            content = web_surfer.fetch_url(url)
-            self._send_json({'status': 'ok', 'url': url, 'title': web_surfer.last_page_title, 'content': content})
+            content = web_surfer.fetch_url(url, max_chars=None)
+            self._send_json({
+                'status': 'ok',
+                'url': url,
+                'title': web_surfer.last_page_title,
+                'chars': web_surfer.last_page_chars,
+                'lines': web_surfer.last_page_lines,
+                'content': content
+            })
 
         elif self.path == '/api/web/learn':
             text = req.get('text', '')
