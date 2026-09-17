@@ -13,7 +13,7 @@
 #endif
 
 // ============================================================
-// Конфигурация модели
+// Конфигурация модели (Иерархический MoE из 144 нод)
 // ============================================================
 typedef struct {
     int vocab_size;
@@ -21,16 +21,31 @@ typedef struct {
     int n_embd;
     int n_layer;
     int n_head;
-    int num_experts;
-    int top_k;
+    int num_parents;      // 4
+    int num_sub_parents;  // 4
+    int num_leaf_experts; // 9 (всего 4 * 4 * 9 = 144 ноды)
+    int top_k;            // 2
+    int mult;             // 2 (hidden = mult * n_embd)
 } Config;
 
 typedef struct {
-    float* w1; // [4 * n_embd, n_embd]
-    float* b1; // [4 * n_embd]
-    float* w2; // [n_embd, 4 * n_embd]
+    float* w1; // [mult * n_embd, n_embd]
+    float* b1; // [mult * n_embd]
+    float* w2; // [n_embd, mult * n_embd]
     float* b2; // [n_embd]
 } ExpertWeights;
+
+typedef struct {
+    float* gate_w; // [num_leaf_experts, n_embd]
+    float* gate_b; // [num_leaf_experts]
+    ExpertWeights* experts; // [num_leaf_experts] (9 экспертов)
+} SubParentWeights;
+
+typedef struct {
+    float* gate_w; // [num_sub_parents, n_embd]
+    float* gate_b; // [num_sub_parents]
+    SubParentWeights* sub_parents; // [num_sub_parents] (4 сабродителя)
+} ParentWeights;
 
 typedef struct {
     float* sa_ln_w;
@@ -41,9 +56,9 @@ typedef struct {
     float* sa_wo;
     float* moe_ln_w;
     float* moe_ln_b;
-    float* moe_gate_w;
-    float* moe_gate_b;
-    ExpertWeights* experts;
+    float* accuracy_gate_w; // [num_parents, n_embd]
+    float* accuracy_gate_b; // [num_parents]
+    ParentWeights* parents; // [num_parents] (4 родителя)
 } LayerWeights;
 
 typedef struct {
@@ -66,11 +81,15 @@ typedef struct {
     float* att;
     float* key_cache;
     float* val_cache;
-    float* gate_logits;
-    float* exp_h;
-    float* exp_out;
-    float* moe_acc;
-    float* logits;
+    float* parent_acc_logits; // [4]
+    float* sub_logits;        // [4]
+    float* leaf_logits;       // [9]
+    float* sub_acc;           // [n_embd]
+    float* parent_acc;        // [n_embd]
+    float* exp_h;             // [mult * n_embd]
+    float* exp_out;           // [n_embd]
+    float* moe_acc;           // [n_embd]
+    float* logits;            // [vocab_size]
 } RunState;
 
 typedef struct {
@@ -80,7 +99,7 @@ typedef struct {
 } Tokenizer;
 
 // ============================================================
-// Математические операторы
+// Математические операторы (Чистый ISO C99: x86, ARM, RISC-V)
 // ============================================================
 
 void layernorm(float* out, float* x, float* w, float* b, int size) {
@@ -185,16 +204,33 @@ int load_model(const char* checkpoint_path, MoEModel* model) {
         lw->sa_wo = ptr; ptr += c.n_embd * c.n_embd;
         lw->moe_ln_w = ptr; ptr += c.n_embd;
         lw->moe_ln_b = ptr; ptr += c.n_embd;
-        lw->moe_gate_w = ptr; ptr += c.num_experts * c.n_embd;
-        lw->moe_gate_b = ptr; ptr += c.num_experts;
 
-        lw->experts = (ExpertWeights*)malloc(c.num_experts * sizeof(ExpertWeights));
-        for (int e = 0; e < c.num_experts; e++) {
-            ExpertWeights* ew = &lw->experts[e];
-            ew->w1 = ptr; ptr += 4 * c.n_embd * c.n_embd;
-            ew->b1 = ptr; ptr += 4 * c.n_embd;
-            ew->w2 = ptr; ptr += c.n_embd * 4 * c.n_embd;
-            ew->b2 = ptr; ptr += c.n_embd;
+        // Master Accuracy Gate
+        lw->accuracy_gate_w = ptr; ptr += c.num_parents * c.n_embd;
+        lw->accuracy_gate_b = ptr; ptr += c.num_parents;
+
+        lw->parents = (ParentWeights*)malloc(c.num_parents * sizeof(ParentWeights));
+        for (int p_idx = 0; p_idx < c.num_parents; p_idx++) {
+            ParentWeights* pw = &lw->parents[p_idx];
+            pw->gate_w = ptr; ptr += c.num_sub_parents * c.n_embd;
+            pw->gate_b = ptr; ptr += c.num_sub_parents;
+
+            pw->sub_parents = (SubParentWeights*)malloc(c.num_sub_parents * sizeof(SubParentWeights));
+            for (int s_idx = 0; s_idx < c.num_sub_parents; s_idx++) {
+                SubParentWeights* spw = &pw->sub_parents[s_idx];
+                spw->gate_w = ptr; ptr += c.num_leaf_experts * c.n_embd;
+                spw->gate_b = ptr; ptr += c.num_leaf_experts;
+
+                spw->experts = (ExpertWeights*)malloc(c.num_leaf_experts * sizeof(ExpertWeights));
+                for (int e = 0; e < c.num_leaf_experts; e++) {
+                    ExpertWeights* ew = &spw->experts[e];
+                    int hidden = c.mult * c.n_embd;
+                    ew->w1 = ptr; ptr += (size_t)hidden * c.n_embd;
+                    ew->b1 = ptr; ptr += hidden;
+                    ew->w2 = ptr; ptr += (size_t)c.n_embd * hidden;
+                    ew->b2 = ptr; ptr += c.n_embd;
+                }
+            }
         }
     }
 
@@ -206,6 +242,7 @@ int load_model(const char* checkpoint_path, MoEModel* model) {
 }
 
 void init_run_state(RunState* s, Config* c) {
+    int hidden = c->mult * c->n_embd;
     s->x = (float*)calloc(c->n_embd, sizeof(float));
     s->xb = (float*)calloc(c->n_embd, sizeof(float));
     s->q = (float*)calloc(c->n_embd, sizeof(float));
@@ -214,15 +251,19 @@ void init_run_state(RunState* s, Config* c) {
     s->att = (float*)calloc(c->n_head * c->block_size, sizeof(float));
     s->key_cache = (float*)calloc((size_t)c->n_layer * c->block_size * c->n_embd, sizeof(float));
     s->val_cache = (float*)calloc((size_t)c->n_layer * c->block_size * c->n_embd, sizeof(float));
-    s->gate_logits = (float*)calloc(c->num_experts, sizeof(float));
-    s->exp_h = (float*)calloc(4 * c->n_embd, sizeof(float));
+    s->parent_acc_logits = (float*)calloc(c->num_parents, sizeof(float));
+    s->sub_logits = (float*)calloc(c->num_sub_parents, sizeof(float));
+    s->leaf_logits = (float*)calloc(c->num_leaf_experts, sizeof(float));
+    s->sub_acc = (float*)calloc(c->n_embd, sizeof(float));
+    s->parent_acc = (float*)calloc(c->n_embd, sizeof(float));
+    s->exp_h = (float*)calloc(hidden, sizeof(float));
     s->exp_out = (float*)calloc(c->n_embd, sizeof(float));
     s->moe_acc = (float*)calloc(c->n_embd, sizeof(float));
     s->logits = (float*)calloc(c->vocab_size, sizeof(float));
 }
 
 // ============================================================
-// Forward Pass
+// Прямой проход (Forward Pass: Self-Attention + Hierarchical MoE)
 // ============================================================
 
 float* forward(MoEModel* model, RunState* s, int token, int pos) {
@@ -230,16 +271,16 @@ float* forward(MoEModel* model, RunState* s, int token, int pos) {
     int d = p->n_embd;
     int head_size = d / p->n_head;
 
-    float* tok_vec = model->token_embedding_table + token * d;
-    float* pos_vec = model->position_embedding_table + (pos % p->block_size) * d;
+    float* token_emb = model->token_embedding_table + token * d;
+    float* pos_emb = model->position_embedding_table + pos * d;
     for (int i = 0; i < d; i++) {
-        s->x[i] = tok_vec[i] + pos_vec[i];
+        s->x[i] = token_emb[i] + pos_emb[i];
     }
 
     for (int l = 0; l < p->n_layer; l++) {
         LayerWeights* lw = &model->layers[l];
 
-        // Self-Attention
+        // 1. Self-Attention
         layernorm(s->xb, s->x, lw->sa_ln_w, lw->sa_ln_b, d);
 
         matmul(s->q, s->xb, lw->sa_wq, d, d);
@@ -285,51 +326,119 @@ float* forward(MoEModel* model, RunState* s, int token, int pos) {
             s->x[i] += s->q[i];
         }
 
-        // Sparse MoE
+        // 2. Hierarchical MoE (144 эксперта через 4 параллельных родителя)
         layernorm(s->xb, s->x, lw->moe_ln_w, lw->moe_ln_b, d);
 
-        matmul(s->gate_logits, s->xb, lw->moe_gate_w, d, p->num_experts);
-        for (int e = 0; e < p->num_experts; e++) {
-            s->gate_logits[e] += lw->moe_gate_b[e];
+        // a) Master Accuracy Gate: оцениваем точность 4 родителей
+        matmul(s->parent_acc_logits, s->xb, lw->accuracy_gate_w, d, p->num_parents);
+        for (int e = 0; e < p->num_parents; e++) {
+            s->parent_acc_logits[e] += lw->accuracy_gate_b[e];
         }
-        softmax(s->gate_logits, p->num_experts);
-
-        int top_indices[8];
-        float top_weights[8];
-        for (int k = 0; k < p->top_k; k++) {
-            int best_idx = -1;
-            float best_val = -1e9f;
-            for (int e = 0; e < p->num_experts; e++) {
-                int already_chosen = 0;
-                for (int prev = 0; prev < k; prev++) {
-                    if (top_indices[prev] == e) already_chosen = 1;
-                }
-                if (!already_chosen && s->gate_logits[e] > best_val) {
-                    best_val = s->gate_logits[e];
-                    best_idx = e;
-                }
-            }
-            top_indices[k] = best_idx;
-            top_weights[k] = best_val;
-        }
-
-        float weight_sum = 0.0f;
-        for (int k = 0; k < p->top_k; k++) weight_sum += top_weights[k];
-        for (int k = 0; k < p->top_k; k++) top_weights[k] /= (weight_sum + 1e-8f);
+        softmax(s->parent_acc_logits, p->num_parents); // [w0, w1, w2, w3]
 
         memset(s->moe_acc, 0, d * sizeof(float));
-        for (int k = 0; k < p->top_k; k++) {
-            int exp_id = top_indices[k];
-            float exp_w = top_weights[k];
-            ExpertWeights* ew = &lw->experts[exp_id];
 
-            matmul(s->exp_h, s->xb, ew->w1, d, 4 * d);
-            for (int i = 0; i < 4 * d; i++) s->exp_h[i] += ew->b1[i];
-            gelu(s->exp_h, 4 * d);
+        // b) 4 параллельные родительские ноды
+        for (int p_idx = 0; p_idx < p->num_parents; p_idx++) {
+            float parent_w = s->parent_acc_logits[p_idx];
+            ParentWeights* parent = &lw->parents[p_idx];
 
-            matmul(s->exp_out, s->exp_h, ew->w2, 4 * d, d);
+            // Маршрутизация сабродителей
+            matmul(s->sub_logits, s->xb, parent->gate_w, d, p->num_sub_parents);
+            for (int s_idx = 0; s_idx < p->num_sub_parents; s_idx++) {
+                s->sub_logits[s_idx] += parent->gate_b[s_idx];
+            }
+            softmax(s->sub_logits, p->num_sub_parents);
+
+            // Выбор Top-K сабродителей (top-2)
+            int top_subs[4];
+            float top_sub_weights[4];
+            int sub_k = (p->top_k < p->num_sub_parents) ? p->top_k : p->num_sub_parents;
+            for (int k = 0; k < sub_k; k++) {
+                int best_idx = -1;
+                float best_val = -1e9f;
+                for (int s_idx = 0; s_idx < p->num_sub_parents; s_idx++) {
+                    int already = 0;
+                    for (int prev = 0; prev < k; prev++) {
+                        if (top_subs[prev] == s_idx) already = 1;
+                    }
+                    if (!already && s->sub_logits[s_idx] > best_val) {
+                        best_val = s->sub_logits[s_idx];
+                        best_idx = s_idx;
+                    }
+                }
+                top_subs[k] = best_idx;
+                top_sub_weights[k] = best_val;
+            }
+            float sub_sum = 0.0f;
+            for (int k = 0; k < sub_k; k++) sub_sum += top_sub_weights[k];
+            for (int k = 0; k < sub_k; k++) top_sub_weights[k] /= (sub_sum + 1e-8f);
+
+            memset(s->parent_acc, 0, d * sizeof(float));
+
+            for (int k = 0; k < sub_k; k++) {
+                int s_idx = top_subs[k];
+                float sub_w = top_sub_weights[k];
+                SubParentWeights* sub = &parent->sub_parents[s_idx];
+
+                // Маршрутизация листовых экспертов (9 экспертов)
+                matmul(s->leaf_logits, s->xb, sub->gate_w, d, p->num_leaf_experts);
+                for (int l_idx = 0; l_idx < p->num_leaf_experts; l_idx++) {
+                    s->leaf_logits[l_idx] += sub->gate_b[l_idx];
+                }
+                softmax(s->leaf_logits, p->num_leaf_experts);
+
+                // Выбор Top-K листовых экспертов (top-2)
+                int top_leaves[8];
+                float top_leaf_weights[8];
+                int leaf_k = (p->top_k < p->num_leaf_experts) ? p->top_k : p->num_leaf_experts;
+                for (int lk = 0; lk < leaf_k; lk++) {
+                    int best_idx = -1;
+                    float best_val = -1e9f;
+                    for (int l_idx = 0; l_idx < p->num_leaf_experts; l_idx++) {
+                        int already = 0;
+                        for (int prev = 0; prev < lk; prev++) {
+                            if (top_leaves[prev] == l_idx) already = 1;
+                        }
+                        if (!already && s->leaf_logits[l_idx] > best_val) {
+                            best_val = s->leaf_logits[l_idx];
+                            best_idx = l_idx;
+                        }
+                    }
+                    top_leaves[lk] = best_idx;
+                    top_leaf_weights[lk] = best_val;
+                }
+                float leaf_sum = 0.0f;
+                for (int lk = 0; lk < leaf_k; lk++) leaf_sum += top_leaf_weights[lk];
+                for (int lk = 0; lk < leaf_k; lk++) top_leaf_weights[lk] /= (leaf_sum + 1e-8f);
+
+                memset(s->sub_acc, 0, d * sizeof(float));
+
+                // Вычисление выбранных листовых экспертов
+                int hidden = p->mult * d;
+                for (int lk = 0; lk < leaf_k; lk++) {
+                    int exp_id = top_leaves[lk];
+                    float exp_w = top_leaf_weights[lk];
+                    ExpertWeights* ew = &sub->experts[exp_id];
+
+                    matmul(s->exp_h, s->xb, ew->w1, d, hidden);
+                    for (int i = 0; i < hidden; i++) s->exp_h[i] += ew->b1[i];
+                    gelu(s->exp_h, hidden);
+
+                    matmul(s->exp_out, s->exp_h, ew->w2, hidden, d);
+                    for (int i = 0; i < d; i++) {
+                        s->sub_acc[i] += exp_w * (s->exp_out[i] + ew->b2[i]);
+                    }
+                }
+
+                for (int i = 0; i < d; i++) {
+                    s->parent_acc[i] += sub_w * s->sub_acc[i];
+                }
+            }
+
+            // Взвешенное суммирование через коэффициент точности родителя
             for (int i = 0; i < d; i++) {
-                s->moe_acc[i] += exp_w * (s->exp_out[i] + ew->b2[i]);
+                s->moe_acc[i] += parent_w * s->parent_acc[i];
             }
         }
 
@@ -345,20 +454,24 @@ float* forward(MoEModel* model, RunState* s, int token, int pos) {
 }
 
 // ============================================================
-// Tokenizer & Sampler
+// Токенизатор и сэмплирование
 // ============================================================
 
-int load_tokenizer(const char* path, Tokenizer* tok) {
-    FILE* f = fopen(path, "rb");
+int load_tokenizer(const char* tok_path, Tokenizer* tok) {
+    FILE* f = fopen(tok_path, "rb");
     if (!f) return 0;
-    if (fread(&tok->vocab_size, sizeof(int), 1, f) != 1) { fclose(f); return 0; }
+
+    if (fread(&tok->vocab_size, sizeof(int), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
 
     tok->vocab = (char**)malloc(tok->vocab_size * sizeof(char*));
     tok->vocab_lens = (int*)malloc(tok->vocab_size * sizeof(int));
 
     for (int i = 0; i < tok->vocab_size; i++) {
-        int len = 0;
-        if (fread(&len, sizeof(int), 1, f) != 1) len = 0;
+        int len;
+        if (fread(&len, sizeof(int), 1, f) != 1) break;
         tok->vocab_lens[i] = len;
         tok->vocab[i] = (char*)malloc(len + 1);
         if (len > 0) {
@@ -370,7 +483,6 @@ int load_tokenizer(const char* path, Tokenizer* tok) {
     return 1;
 }
 
-// Поиск токенов для пользовательского промпта
 int encode_prompt(Tokenizer* tok, const char* text, int* out_tokens, int max_tokens) {
     int n = 0;
     int len = (int)strlen(text);
@@ -396,7 +508,6 @@ int encode_prompt(Tokenizer* tok, const char* text, int* out_tokens, int max_tok
             out_tokens[n++] = best_id;
             i += best_len;
         } else {
-            // fallback: одиночный символ
             unsigned char b = (unsigned char)text[i];
             for (int v = 0; v < tok->vocab_size; v++) {
                 if (tok->vocab_lens[v] == 1 && (unsigned char)tok->vocab[v][0] == b) {
@@ -414,7 +525,6 @@ int encode_prompt(Tokenizer* tok, const char* text, int* out_tokens, int max_tok
 }
 
 int sample_token(float* logits, int vocab_size, float temperature, int top_k, const int* recent_tokens, int num_recent, float repeat_penalty) {
-    // 1. Repetition penalty (штраф за повторы)
     if (repeat_penalty > 1.0f && num_recent > 0) {
         for (int r = 0; r < num_recent; r++) {
             int tok_id = recent_tokens[r];
@@ -440,7 +550,6 @@ int sample_token(float* logits, int vocab_size, float temperature, int top_k, co
         return best_idx;
     }
 
-    // Top-K фильтрация
     if (top_k > 0 && top_k < vocab_size) {
         int top_indices[64];
         if (top_k > 64) top_k = 64;
@@ -483,6 +592,93 @@ int sample_token(float* logits, int vocab_size, float temperature, int top_k, co
 }
 
 // ============================================================
+// Генератор ответов (CLI & Interactive)
+// ============================================================
+
+void generate_response(MoEModel* model, Tokenizer* tok, RunState* state, const char* input_text) {
+    char input_buf[1024];
+    strncpy(input_buf, input_text, sizeof(input_buf) - 1);
+    input_buf[sizeof(input_buf) - 1] = '\0';
+
+    size_t slen = strlen(input_buf);
+    while (slen > 0 && (input_buf[slen - 1] == '\n' || input_buf[slen - 1] == '\r')) {
+        input_buf[--slen] = '\0';
+    }
+
+    // Удаление UTF-8 BOM маркера (если вывод передан через PowerShell pipe)
+    char* clean_input = input_buf;
+    if ((unsigned char)clean_input[0] == 0xEF && 
+        (unsigned char)clean_input[1] == 0xBB && 
+        (unsigned char)clean_input[2] == 0xBF) {
+        clean_input += 3;
+    }
+    while (*clean_input == ' ' || *clean_input == '\t') clean_input++;
+
+    if (strlen(clean_input) == 0) return;
+
+    int prompt_tokens[256];
+    int num_prompt_tokens = 0;
+    // 1. Префикс: "User:"
+    prompt_tokens[num_prompt_tokens++] = 12982; // 'User'
+    prompt_tokens[num_prompt_tokens++] = 25;    // ':'
+
+    // 2. Ввод пользователя с ведущим пробелом для точного выравнивания GPT-2 BPE
+    char spaced_input[1024];
+    snprintf(spaced_input, sizeof(spaced_input), " %s", clean_input);
+    int n_user = encode_prompt(tok, spaced_input, prompt_tokens + num_prompt_tokens, 200);
+    num_prompt_tokens += n_user;
+
+    // 3. Суффикс: "\n\nKobyakovAI:\n"
+    const int suffix[8] = {198, 198, 42, 26730, 44715, 20185, 25, 198};
+    for (int s = 0; s < 8; s++) {
+        prompt_tokens[num_prompt_tokens++] = suffix[s];
+    }
+
+    printf("\n🤖 \033[96mKobyakovAI:\033[0m\n");
+    fflush(stdout);
+
+    clock_t start = clock();
+
+    int current_token = prompt_tokens[0];
+    int pos = 0;
+
+    for (int p = 0; p < num_prompt_tokens - 1 && p < model->config.block_size - 1; p++) {
+        forward(model, state, prompt_tokens[p], pos++);
+    }
+    current_token = prompt_tokens[num_prompt_tokens - 1];
+
+    int max_new_tokens = 150;
+    int generated_count = 0;
+    int recent_tokens[64];
+    int num_recent = 0;
+
+    for (; generated_count < max_new_tokens && pos < model->config.block_size - 1; pos++, generated_count++) {
+        float* logits = forward(model, state, current_token, pos);
+        current_token = sample_token(logits, model->config.vocab_size, 0.0f, 0, recent_tokens, num_recent, 1.1f);
+
+        // Остановка при маркере конца текста (50256) или начале нового раунда User: (12982)
+        if (current_token == 50256 || current_token == 12982) break;
+
+        if (current_token < tok->vocab_size) {
+            const char* piece = tok->vocab[current_token];
+            if (strstr(piece, "User:") != NULL) break;
+            printf("%s", piece);
+            fflush(stdout);
+        }
+
+        recent_tokens[num_recent % 64] = current_token;
+        if (num_recent < 64) num_recent++;
+    }
+
+    printf("\n");
+    clock_t end = clock();
+    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+    double tps = (elapsed > 0.0001) ? (generated_count / elapsed) : 0.0;
+    printf("\033[90m[Generated %d tokens in %.2fs (%.1f tok/s)]\033[0m\n", generated_count, elapsed, tps);
+    printf("------------------------------------------------------------\n");
+}
+
+// ============================================================
 // Интерактивный генератор (Интерпретатор)
 // ============================================================
 
@@ -491,11 +687,12 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
     init_run_state(&state, &model->config);
 
     char input_buf[1024];
-    int prompt_tokens[256];
+    int total_leaf = model->config.num_parents * model->config.num_sub_parents * model->config.num_leaf_experts;
 
     printf("============================================================\n");
-    printf("  🤖 KobyakovAI - MoE Deep Intelligence Shell\n");
-    printf("  Pure C Brain (Compiled with Zig cc) | 52.6M Params (8 Experts)\n");
+    printf("  🤖 KobyakovAI - Hierarchical MoE Shell (Pure C / Zig)\n");
+    printf("  Nodes: %d Leaf Experts (4 Parents x 4 Subs x 9 Leaves)\n", total_leaf);
+    printf("  Portability: x86_64, ARM64 (Apple/Pi), RISC-V Compatible\n");
     printf("  Type your prompt and press Enter.\n");
     printf("  Type 'exit' or 'quit' to exit.\n");
     printf("============================================================\n\n");
@@ -506,85 +703,14 @@ void run_interactive(MoEModel* model, Tokenizer* tok) {
 
         if (!fgets(input_buf, sizeof(input_buf), stdin)) break;
 
-        size_t slen = strlen(input_buf);
-        while (slen > 0 && (input_buf[slen - 1] == '\n' || input_buf[slen - 1] == '\r')) {
-            input_buf[--slen] = '\0';
-        }
-
-        // Strip UTF-8 BOM if piped from PowerShell
-        char* clean_input = input_buf;
-        if ((unsigned char)clean_input[0] == 0xEF && 
-            (unsigned char)clean_input[1] == 0xBB && 
-            (unsigned char)clean_input[2] == 0xBF) {
-            clean_input += 3;
-        }
-        while (*clean_input == ' ' || *clean_input == '\t') clean_input++;
-
-        if (strlen(clean_input) == 0) continue;
-        if (strcmp(clean_input, "exit") == 0 || strcmp(clean_input, "quit") == 0) {
+        char* trimmed = input_buf;
+        while (*trimmed == ' ' || *trimmed == '\t' || *trimmed == '\r' || *trimmed == '\n') trimmed++;
+        if (strcmp(trimmed, "exit") == 0 || strcmp(trimmed, "quit") == 0) {
             printf("Goodbye!\n");
             break;
         }
 
-        int num_prompt_tokens = 0;
-        // 1. Prefix: "User:"
-        prompt_tokens[num_prompt_tokens++] = 12982; // 'User'
-        prompt_tokens[num_prompt_tokens++] = 25;    // ':'
-
-        // 2. User text with leading space for exact BPE tokenization
-        char spaced_input[1024];
-        snprintf(spaced_input, sizeof(spaced_input), " %s", clean_input);
-        int n_user = encode_prompt(tok, spaced_input, prompt_tokens + num_prompt_tokens, 200);
-        num_prompt_tokens += n_user;
-
-        // 3. Suffix: "\n\nKobyakovAI:\n"
-        const int suffix[8] = {198, 198, 42, 26730, 44715, 20185, 25, 198};
-        for (int s = 0; s < 8; s++) {
-            prompt_tokens[num_prompt_tokens++] = suffix[s];
-        }
-
-        printf("\n🤖 \033[96mKobyakovAI:\033[0m\n");
-        fflush(stdout);
-
-        clock_t start = clock();
-
-        int current_token = prompt_tokens[0];
-        int pos = 0;
-
-        for (int p = 0; p < num_prompt_tokens - 1 && p < model->config.block_size - 1; p++) {
-            forward(model, &state, prompt_tokens[p], pos++);
-        }
-        current_token = prompt_tokens[num_prompt_tokens - 1];
-
-        int max_new_tokens = 120;
-        int generated_count = 0;
-        int recent_tokens[64];
-        int num_recent = 0;
-
-        for (; generated_count < max_new_tokens && pos < model->config.block_size - 1; pos++, generated_count++) {
-            float* logits = forward(model, &state, current_token, pos);
-            current_token = sample_token(logits, model->config.vocab_size, 0.0f, 0, recent_tokens, num_recent, 1.1f);
-
-            // Остановка при маркере конца текста или переходе к User:
-            if (current_token == 50256 || current_token == 12982) break;
-
-            if (current_token < tok->vocab_size) {
-                const char* piece = tok->vocab[current_token];
-                if (strstr(piece, "User:") != NULL) break;
-                printf("%s", piece);
-                fflush(stdout);
-            }
-
-            recent_tokens[num_recent % 64] = current_token;
-            if (num_recent < 64) num_recent++;
-        }
-
-        printf("\n");
-        clock_t end = clock();
-        double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
-        double tps = (elapsed > 0.0001) ? (generated_count / elapsed) : 0.0;
-        printf("\033[90m[Generated %d tokens in %.2fs (%.1f tok/s)]\033[0m\n", generated_count, elapsed, tps);
-        printf("------------------------------------------------------------\n");
+        generate_response(model, tok, &state, input_buf);
     }
 }
 
@@ -611,7 +737,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    run_interactive(&model, &tok);
+    if (argc > 3) {
+        // Одиночный запуск промпта из аргументов командной строки
+        RunState state;
+        init_run_state(&state, &model.config);
+        generate_response(&model, &tok, &state, argv[3]);
+    } else {
+        // Интерактивный режим
+        run_interactive(&model, &tok);
+    }
 
     return 0;
 }

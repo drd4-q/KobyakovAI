@@ -11,6 +11,7 @@ import torch.optim as optim
 import tiktoken
 from model import CodeLanguageModel
 from data_loader import StreamingDataLoader
+from export_weights import export_model_bin
 
 def train_cuda(
     domain="code",
@@ -34,11 +35,15 @@ def train_cuda(
     vocab_size = enc.n_vocab
     n_embd = 256
     n_head = 8
-    n_layer = 6
-    num_experts = 8
+    n_layer = 2
+    num_parents = 4
+    num_sub_parents = 4
+    num_leaf_experts = 9
     top_k = 2
+    mult = 2
+    total_leaf_nodes = num_parents * num_sub_parents * num_leaf_experts
 
-    print(f"Initializing MoE model ({n_layer} layers, {n_embd} dim, {num_experts} experts, top-{top_k})...")
+    print(f"Initializing Hierarchical MoE ({n_layer} layers, {num_parents} parents x {num_sub_parents} sub x {num_leaf_experts} leaves = {total_leaf_nodes} nodes)...")
     model = CodeLanguageModel(
         vocab_size=vocab_size,
         n_embd=n_embd,
@@ -46,14 +51,16 @@ def train_cuda(
         n_layer=n_layer,
         block_size=block_size,
         dropout=0.1,
-        num_experts=num_experts,
-        top_k=top_k
+        num_parents=num_parents,
+        num_sub_parents=num_sub_parents,
+        num_leaf_experts=num_leaf_experts,
+        top_k=top_k,
+        mult=mult
     )
     model.to(device)
     num_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Total parameters: {num_params:.2f} M")
 
-    # If model.bin exists, we can start from it or train fresh
     checkpoint_pth = "moe_model_weights.pth"
     if os.path.exists(checkpoint_pth):
         try:
@@ -94,54 +101,12 @@ def train_cuda(
     # Export directly to native C model.bin
     print(f"Exporting directly to native C format ({output_bin})...")
     model.eval()
-    with open(output_bin, "wb") as f:
-        header = struct.pack("iiiiiii", vocab_size, block_size, n_embd, n_layer, n_head, num_experts, top_k)
-        f.write(header)
-        f.write(model.token_embedding_table.weight.detach().cpu().numpy().astype("float32").tobytes())
-        f.write(model.position_embedding_table.weight.detach().cpu().numpy().astype("float32").tobytes())
-
-        for block in model.blocks:
-            f.write(block.ln1.weight.detach().cpu().numpy().astype("float32").tobytes())
-            f.write(block.ln1.bias.detach().cpu().numpy().astype("float32").tobytes())
-
-            wq = torch.cat([h.query.weight for h in block.sa.heads], dim=0)
-            wk = torch.cat([h.key.weight for h in block.sa.heads], dim=0)
-            wv = torch.cat([h.value.weight for h in block.sa.heads], dim=0)
-            wo = block.sa.proj.weight
-            f.write(wq.detach().cpu().numpy().astype("float32").tobytes())
-            f.write(wk.detach().cpu().numpy().astype("float32").tobytes())
-            f.write(wv.detach().cpu().numpy().astype("float32").tobytes())
-            f.write(wo.detach().cpu().numpy().astype("float32").tobytes())
-
-            f.write(block.ln2.weight.detach().cpu().numpy().astype("float32").tobytes())
-            f.write(block.ln2.bias.detach().cpu().numpy().astype("float32").tobytes())
-
-            f.write(block.moe.gate.weight.detach().cpu().numpy().astype("float32").tobytes())
-            if block.moe.gate.bias is not None:
-                f.write(block.moe.gate.bias.detach().cpu().numpy().astype("float32").tobytes())
-            else:
-                f.write(torch.zeros(num_experts, dtype=torch.float32).numpy().tobytes())
-
-            for exp in block.moe.experts:
-                w1 = exp.net[0].weight
-                b1 = exp.net[0].bias
-                w2 = exp.net[2].weight
-                b2 = exp.net[2].bias
-                f.write(w1.detach().cpu().numpy().astype("float32").tobytes())
-                f.write(b1.detach().cpu().numpy().astype("float32").tobytes())
-                f.write(w2.detach().cpu().numpy().astype("float32").tobytes())
-                f.write(b2.detach().cpu().numpy().astype("float32").tobytes())
-
-        f.write(model.ln_f.weight.detach().cpu().numpy().astype("float32").tobytes())
-        f.write(model.ln_f.bias.detach().cpu().numpy().astype("float32").tobytes())
-        f.write(model.lm_head.weight.detach().cpu().numpy().astype("float32").tobytes())
-
-    print(f"Done! {output_bin} updated for engine_c.exe!")
+    export_model_bin(model, output_bin)
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--domain", type=str, default="all", choices=["code", "math", "reasoning", "logic", "physics", "chat", "all"])
+    parser.add_argument("--domain", type=str, default="code", choices=["code", "math", "reasoning", "logic", "physics", "chat", "all"])
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gdrive_dir", type=str, default="G:/My Drive/datasets", help="Путь к папке датасетов на Google Диске (по умолчанию 'G:/My Drive/datasets')")
