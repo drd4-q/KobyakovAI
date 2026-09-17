@@ -1,6 +1,7 @@
 import os
 import sys
 import struct
+import signal
 
 # Force UTF-8 on Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -76,32 +77,56 @@ def train_cuda(
     use_amp = (device == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    print(f"\nTraining for {steps} steps on {device.upper()}...")
+    print(f"\nTraining for {steps} steps on {device.upper()}... (Нажмите Ctrl+C в любой момент для безопасного сохранения)")
     model.train()
 
-    for step in range(1, steps + 1):
-        x, y = loader.get_batch()
+    completed_steps = 0
+    try:
+        for step in range(1, steps + 1):
+            x, y = loader.get_batch()
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits, loss = model(x, y)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, loss = model(x, y)
 
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            completed_steps = step
 
-        if step == 1 or step % 50 == 0 or step == steps:
-            print(f"Step {step:4d} / {steps} | Loss: \033[92m{loss.item():.4f}\033[0m")
+            if step == 1 or step % 50 == 0 or step == steps:
+                print(f"Step {step:4d} / {steps} | Loss: \033[92m{loss.item():.4f}\033[0m")
 
-    print("\nTraining completed!")
-    # Save PyTorch checkpoint
-    torch.save(model.state_dict(), checkpoint_pth)
-    print(f"Saved PyTorch weights to {checkpoint_pth}")
+            # Периодическое автосохранение каждые 250 шагов
+            if step % 250 == 0 and step < steps:
+                torch.save(model.state_dict(), checkpoint_pth)
+                model.eval()
+                export_model_bin(model, output_bin)
+                model.train()
+                print(f"  \033[90m[Автосохранение чекпоинта и model.bin на шаге {step}]\033[0m")
 
-    # Export directly to native C model.bin
-    print(f"Exporting directly to native C format ({output_bin})...")
-    model.eval()
-    export_model_bin(model, output_bin)
+        print("\nTraining completed!")
+    except KeyboardInterrupt:
+        print(f"\n\n\033[93m[⚠️ Остановка по Ctrl+C] Обучение прервано пользователем на шаге {completed_steps} из {steps}!\033[0m")
+        print("\033[93mИдет сохранение накопленного прогресса в веса...\033[0m")
+
+    # Save PyTorch checkpoint and export to C engine
+    if completed_steps > 0:
+        # Временно блокируем повторный Ctrl+C во время записи на диск
+        prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            torch.save(model.state_dict(), checkpoint_pth)
+            print(f"\033[92m[✓] PyTorch веса сохранены в {checkpoint_pth} (пройдено шагов: {completed_steps})\033[0m")
+
+            # Export directly to native C model.bin
+            print(f"Экспорт весов в нативный C-движок ({output_bin})...")
+            model.eval()
+            export_model_bin(model, output_bin)
+            print(f"\033[92m[✓] Все {completed_steps} шагов успешно зафиксированы в model.bin для C-движка!\033[0m")
+        finally:
+            signal.signal(signal.SIGINT, prev_handler)
+    else:
+        print("Обучение остановлено до первого шага, сохранение пропущено.")
 
 if __name__ == "__main__":
     import argparse
