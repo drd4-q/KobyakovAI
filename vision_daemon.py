@@ -27,12 +27,14 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 from screen_vision import ScreenCapture, ScreenVisionModel
+from web_surfer import WebSurfer
 
 HOST = '127.0.0.1'
 PORT = 8999
 
 # Global singletons
 capture = ScreenCapture()
+web_surfer = WebSurfer()
 vision_model = None
 vision_lock = threading.Lock()
 
@@ -342,13 +344,22 @@ def train_monitor_thread(proc, steps):
                     train_state['status'] = f'Шаг {train_state["step"]} / {train_state["total_steps"]}'
                 except Exception:
                     pass
-            elif 'сохранены' in line_str or 'зафиксированы' in line_str:
+            elif 'сохранены' in line_str or 'зафиксированы' in line_str or 'Остановка' in line_str:
                 train_state['status'] = line_str
 
     proc.wait()
+    if os.path.exists("train_stop.flag"):
+        try:
+            os.remove("train_stop.flag")
+        except Exception:
+            pass
+
     with train_lock:
         train_state['running'] = False
-        train_state['status'] = f'Обучение завершено (сохранено на шаге {train_state["step"]})'
+        if 'Останов' in train_state.get('status', '') or 'Останов' in train_state.get('last_log', ''):
+            train_state['status'] = f'Обучение остановлено и зафиксировано (на шаге {train_state["step"]})'
+        else:
+            train_state['status'] = f'Обучение завершено (сохранено на шаге {train_state["step"]})'
         train_process = None
     global brain_model
     with brain_lock:
@@ -401,6 +412,16 @@ class DaemonHandler(BaseHTTPRequestHandler):
                     'learned_count': len(video_engine.learned_log),
                     'learned_log': '\n'.join(video_engine.learned_log)
                 })
+
+        elif self.path == '/api/web/status':
+            self._send_json({
+                'status': 'ok',
+                'last_query': web_surfer.last_query,
+                'last_results': web_surfer.last_results,
+                'last_page_url': web_surfer.last_page_url,
+                'last_page_title': web_surfer.last_page_title,
+                'history': web_surfer.history
+            })
 
         elif self.path == '/api/ping':
             self._send_json({'status': 'ok', 'message': 'KobyakovAI Daemon is active'})
@@ -478,6 +499,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/chat':
             user_prompt = req.get('prompt', '')
             use_vision = req.get('use_vision', False)
+            use_web = req.get('use_web', False)
             target = req.get('target', None)
             hwnd = req.get('hwnd', None)
             target_key = hwnd if (hwnd and isinstance(hwnd, int) and hwnd > 0) else target
@@ -493,31 +515,68 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 visual_summary = v_model.analyze(im, prompt='Кратко опиши содержимое экрана/окна, код, текст и элементы.')
                 visual_context = f'[Визуальный контекст экрана (SmolVLM)]: {visual_summary}\n\n'
 
-            full_prompt = f'{visual_context}User: {user_prompt}\n\nKobyakovAI:\n'
+            web_context = ''
+            web_header = ''
+            snippets_text = ''
+            if use_web and user_prompt.strip():
+                print(f"[VisionDaemon] Контролируемый поиск в сети по запросу: «{user_prompt}»...")
+                search_results = web_surfer.search(user_prompt, max_results=3)
+                if search_results:
+                    domains = ", ".join(dict.fromkeys(r.get('domain', 'web') for r in search_results))
+                    web_header = f"🔍 [Поиск в сети]: «{user_prompt}»\n🌐 [Источники]: {domains}\n\n"
+                    snippets_text = "\n".join(f"• {r['snippet']}" for r in search_results)
+                    web_context = f"[Факты из веб-поиска]:\n{snippets_text}\n\n"
+
+            full_prompt = f'{visual_context}{web_context}User: {user_prompt}\n\nKobyakovAI:\n'
             resp = ""
 
-            # Быстрый инференс в памяти через PyTorch MoE (60 токенов для моментального ответа <3 сек)
+            # Быстрый инференс в памяти через PyTorch MoE с защитой от повторений и зацикливания
             bm, b_enc = get_brain_model()
             if bm is not None and b_enc is not None:
                 try:
                     import torch
                     m, dev = bm
                     input_ids = b_enc.encode(full_prompt)
-                    x = torch.tensor([input_ids], dtype=torch.long, device=dev)
+                    # Ограничиваем вход окном контекста
+                    x = torch.tensor([input_ids[-100:]], dtype=torch.long, device=dev)
                     out_tokens = []
+                    max_gen_tokens = 35 if web_header else 55
                     with torch.no_grad():
-                        for _ in range(60):
+                        for _ in range(max_gen_tokens):
                             cond_x = x[:, -128:]
                             with torch.amp.autocast(device_type="cuda", enabled=(dev == "cuda")):
                                 logits, _ = m(cond_x)
-                            next_tok = torch.argmax(logits[0, -1, :]).item()
+                            cur_logits = logits[0, -1, :].clone()
+
+                            # Штраф за повторение недавних токенов (Repetition Penalty)
+                            for pt in set(out_tokens[-35:]):
+                                if cur_logits[pt] > 0:
+                                    cur_logits[pt] /= 1.4
+                                else:
+                                    cur_logits[pt] *= 1.4
+
+                            # Мягкое сэмплирование (Temperature + Top-k)
+                            probs = torch.softmax(cur_logits / 0.65, dim=-1)
+                            top_k_probs, top_k_idx = torch.topk(probs, 40)
+                            top_k_probs = top_k_probs / torch.sum(top_k_probs)
+                            next_tok = top_k_idx[torch.multinomial(top_k_probs, 1)].item()
+
                             if next_tok in (50256, 12982):
                                 break
                             out_tokens.append(next_tok)
                             x = torch.cat([x, torch.tensor([[next_tok]], device=dev)], dim=1)
+
+                            # Детектор зацикливания (Anti-looping breaker)
+                            if len(out_tokens) >= 8 and out_tokens[-3:] == out_tokens[-6:-3]:
+                                break
+
                     resp = b_enc.decode(out_tokens).strip()
                 except Exception as e:
                     print(f"[VisionDaemon] Ошибка ин-мемори инференса: {e}")
+
+            # Если был веб-поиск и есть точные факты: выдаем проверенный структурированный ответ
+            if web_header:
+                resp = f"{web_header}{snippets_text}"
 
             # Фолбэк на C engine
             if not resp:
@@ -547,6 +606,26 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 'response': resp
             })
 
+        elif self.path == '/api/web/search':
+            q = req.get('query', '')
+            max_res = int(req.get('max_results', 4))
+            results = web_surfer.search(q, max_results=max_res)
+            self._send_json({'status': 'ok', 'query': q, 'results': results})
+
+        elif self.path == '/api/web/fetch':
+            url = req.get('url', '')
+            content = web_surfer.fetch_url(url)
+            self._send_json({'status': 'ok', 'url': url, 'title': web_surfer.last_page_title, 'content': content})
+
+        elif self.path == '/api/web/learn':
+            text = req.get('text', '')
+            source = req.get('source', 'Web')
+            loss_val = None
+            if text and len(text) > 20:
+                train_text = f"User: Что известно о {source}?\n\nKobyakovAI:\n{text[:350]}\n"
+                loss_val = active_learner.train_sample(train_text)
+            self._send_json({'status': 'ok', 'loss': loss_val, 'steps': active_learner.step_count})
+
         elif self.path == '/api/train/start':
             global train_process
             with train_lock:
@@ -557,13 +636,14 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 steps = int(req.get('steps', 1000))
                 domain = req.get('domain', 'all')
 
-                cmd = [sys.executable, 'train_gpu.py', '--steps', str(steps), '--domain', domain]
+                cmd = [sys.executable, '-u', 'train_gpu.py', '--steps', str(steps), '--domain', domain]
                 train_process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     encoding='utf-8',
+                    errors='replace',
                     bufsize=1,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 )
@@ -579,10 +659,44 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 self._send_json({'status': 'started', 'steps': steps, 'domain': domain})
 
         elif self.path == '/api/train/stop':
+            # 1. Записываем файл-флаг остановки (мгновенно считывается train_gpu.py на следующем шаге)
+            try:
+                with open('train_stop.flag', 'w', encoding='utf-8') as f:
+                    f.write('stop')
+                print('[VisionDaemon] Создан файл-флаг train_stop.flag')
+            except Exception as e:
+                print(f'[VisionDaemon] Ошибка создания флага остановки: {e}')
+
             with train_lock:
                 if train_process and train_process.poll() is None:
-                    print('[VisionDaemon] Посылаем сигнал SIGINT (Ctrl+C) процессу обучения...')
-                    train_process.send_signal(signal.CTRL_C_EVENT)
+                    print('[VisionDaemon] Посылаем сигнал остановки процессу обучения...')
+                    try:
+                        if hasattr(signal, 'CTRL_BREAK_EVENT'):
+                            train_process.send_signal(signal.CTRL_BREAK_EVENT)
+                        elif hasattr(signal, 'CTRL_C_EVENT'):
+                            train_process.send_signal(signal.CTRL_C_EVENT)
+                    except Exception as e:
+                        print(f'[VisionDaemon] Ошибка отправки сигнала: {e}')
+
+                    train_state['status'] = 'Остановка... Сохранение весов...'
+
+                    # Фоновый watchdog для гарантии завершения (до 6 секунд на сохранение чекпоинта)
+                    def stop_watchdog(p):
+                        for _ in range(30):
+                            time.sleep(0.2)
+                            if p.poll() is not None:
+                                return
+                        if p.poll() is None:
+                            print('[VisionDaemon] Процесс не завершился в срок, принудительное закрытие...')
+                            try:
+                                p.terminate()
+                                time.sleep(0.5)
+                                if p.poll() is None:
+                                    p.kill()
+                            except Exception:
+                                pass
+                    threading.Thread(target=stop_watchdog, args=(train_process,), daemon=True).start()
+
                     self._send_json({'status': 'stopping', 'message': 'Сигнал остановки отправлен, идет сохранение весов...'})
                 else:
                     self._send_json({'status': 'not_running', 'message': 'Обучение не запущено'})
@@ -596,6 +710,8 @@ def run_daemon():
     print(f'  🚀 KobyakovAI Vision, Brain & Active Learning Daemon: http://{HOST}:{PORT}')
     print('  Ready to serve KobyakovAI.exe Studio GUI')
     print('=' * 65)
+    # Фоновый прогрев весов MoE модели для мгновенного первого ответа
+    threading.Thread(target=get_brain_model, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), DaemonHandler)
     try:
         server.serve_forever()

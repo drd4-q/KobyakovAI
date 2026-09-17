@@ -32,7 +32,14 @@ typedef struct {
     char chat_input[512];
     char chat_history[32768];
     int use_vision;
+    int use_web;
     int is_thinking;
+
+    // Веб-серфинг
+    char web_input[512];
+    char web_results_text[16384];
+    char web_status[256];
+    int web_is_loading;
 
     // Список окон
     char window_titles[40][128];
@@ -389,8 +396,8 @@ void send_chat_message(AppState* s) {
     char req[2048];
     int hwnd = (s->use_vision && s->selected_window_idx > 0) ? s->window_hwnds[s->selected_window_idx] : 0;
     const char* win = (s->use_vision && s->selected_window_idx > 0) ? s->window_titles[s->selected_window_idx] : "";
-    snprintf(req, sizeof(req), "{\"prompt\": \"%s\", \"use_vision\": %s, \"target\": \"%s\", \"hwnd\": %d}",
-             s->chat_input, s->use_vision ? "true" : "false", win, hwnd);
+    snprintf(req, sizeof(req), "{\"prompt\": \"%s\", \"use_vision\": %s, \"use_web\": %s, \"target\": \"%s\", \"hwnd\": %d}",
+             s->chat_input, s->use_vision ? "true" : "false", s->use_web ? "true" : "false", win, hwnd);
 
     s->chat_input[0] = '\0';
     s->is_thinking = 1;
@@ -420,6 +427,128 @@ void send_chat_message(AppState* s) {
     s->is_thinking = 0;
 }
 
+// ============================================================
+// Контролируемый Веб-серфинг & Поиск
+// ============================================================
+void perform_web_search(AppState* s) {
+    if (strlen(s->web_input) == 0) return;
+    s->web_is_loading = 1;
+    strcpy(s->web_status, "🔍 Выполняется поиск в сети...");
+
+    char req[1024];
+    snprintf(req, sizeof(req), "{\"query\": \"%s\", \"max_results\": 4}", s->web_input);
+    char resp[16384];
+    if (http_post_json("/api/web/search", req, resp, sizeof(resp))) {
+        char* p = strstr(resp, "\"results\":");
+        if (p) {
+            char clean[16384];
+            clean[0] = '\0';
+            char* cur = p;
+            int item_idx = 1;
+            while ((cur = strstr(cur, "{\"title\":")) != NULL && item_idx <= 5) {
+                char* p_t = strstr(cur, "\"title\":");
+                char* p_u = strstr(cur, "\"url\":");
+                char* p_s = strstr(cur, "\"snippet\":");
+                if (p_t && p_u && p_s) {
+                    char title[256] = {0};
+                    char url[256] = {0};
+                    char snippet[1024] = {0};
+
+                    p_t += 8; while (*p_t == ' ' || *p_t == '"') p_t++;
+                    char* e_t = strchr(p_t, '"');
+                    if (e_t) { int len = (int)(e_t - p_t); if (len > 250) len = 250; strncpy(title, p_t, len); }
+
+                    p_u += 6; while (*p_u == ' ' || *p_u == '"') p_u++;
+                    char* e_u = strchr(p_u, '"');
+                    if (e_u) { int len = (int)(e_u - p_u); if (len > 250) len = 250; strncpy(url, p_u, len); }
+
+                    p_s += 10; while (*p_s == ' ' || *p_s == '"') p_s++;
+                    char* e_s = strchr(p_s, '"');
+                    if (e_s) { int len = (int)(e_s - p_s); if (len > 1000) len = 1000; strncpy(snippet, p_s, len); }
+
+                    int cl = (int)strlen(clean);
+                    snprintf(clean + cl, sizeof(clean) - cl,
+                             "[%d] %s\nСсылка: %s\nСуть: %s\n------------------------------------------------------------\n",
+                             item_idx, title, url, snippet);
+                    item_idx++;
+                }
+                cur += 9;
+            }
+            if (strlen(clean) > 0) {
+                strncpy(s->web_results_text, clean, sizeof(s->web_results_text) - 1);
+                snprintf(s->web_status, sizeof(s->web_status), "✓ Найдено %d релевантных источников в сети.", item_idx - 1);
+            } else {
+                strcpy(s->web_results_text, "По вашему запросу ничего не найдено.\n");
+                strcpy(s->web_status, "Ничего не найдено.");
+            }
+        }
+    } else {
+        strcpy(s->web_status, "Ошибка соединения с поисковым модулем.");
+    }
+    s->web_is_loading = 0;
+}
+
+void perform_web_fetch(AppState* s) {
+    if (strlen(s->web_input) == 0) return;
+    s->web_is_loading = 1;
+    strcpy(s->web_status, "🌐 Загрузка и анализ веб-страницы...");
+
+    char req[1024];
+    snprintf(req, sizeof(req), "{\"url\": \"%s\"}", s->web_input);
+    char resp[32768];
+    if (http_post_json("/api/web/fetch", req, resp, sizeof(resp))) {
+        char* p_c = strstr(resp, "\"content\":");
+        if (p_c) {
+            p_c += 10;
+            while (*p_c == ' ' || *p_c == '"') p_c++;
+            char* end = strrchr(p_c, '"');
+            if (end) *end = '\0';
+            char clean[16384];
+            int ci = 0;
+            for (int i = 0; p_c[i] && ci < 16000; i++) {
+                if (p_c[i] == '\\' && p_c[i+1] == 'n') { clean[ci++] = '\n'; i++; }
+                else if (p_c[i] == '\\' && p_c[i+1] == '"') { clean[ci++] = '"'; i++; }
+                else clean[ci++] = p_c[i];
+            }
+            clean[ci] = '\0';
+            strncpy(s->web_results_text, clean, sizeof(s->web_results_text) - 1);
+            strcpy(s->web_status, "✓ Страница успешно прочитана и очищена от мусора.");
+        }
+    } else {
+        strcpy(s->web_status, "Ошибка перехода по ссылке.");
+    }
+    s->web_is_loading = 0;
+}
+
+void send_web_to_chat(AppState* s) {
+    if (strlen(s->web_results_text) == 0) return;
+    int cur_len = (int)strlen(s->chat_history);
+    snprintf(s->chat_history + cur_len, sizeof(s->chat_history) - cur_len,
+             "\n[🌐 Контекст из Веб-серфера]:\n%s\n------------------------------------------------------------\n",
+             s->web_results_text);
+    s->current_tab = 0;
+}
+
+void learn_web_content(AppState* s) {
+    if (strlen(s->web_results_text) == 0) return;
+    char req[4096];
+    char escaped[3000];
+    int ei = 0;
+    for (int i = 0; s->web_results_text[i] && ei < 2800; i++) {
+        if (s->web_results_text[i] == '"') { escaped[ei++] = '\\'; escaped[ei++] = '"'; }
+        else if (s->web_results_text[i] == '\n') { escaped[ei++] = ' '; }
+        else escaped[ei++] = s->web_results_text[i];
+    }
+    escaped[ei] = '\0';
+    snprintf(req, sizeof(req), "{\"text\": \"%s\", \"source\": \"Веб-страница\"}", escaped);
+    char resp[512];
+    if (http_post_json("/api/web/learn", req, resp, sizeof(resp))) {
+        strcpy(s->web_status, "✓ Веб-знания успешно усвоены и внедрены в веса MoE нейросети!");
+    }
+}
+
+void poll_training_status(AppState* s);
+
 void start_training(AppState* s) {
     const char* domains[] = {"all", "code", "math", "logic"};
     const char* domain = domains[s->train_domain % 4];
@@ -433,10 +562,21 @@ void start_training(AppState* s) {
 }
 
 void stop_training(AppState* s) {
-    char resp[512];
-    if (http_post_json("/api/train/stop", "{}", resp, sizeof(resp))) {
-        strcpy(s->train_status, "Остановка... Безопасное сохранение чекпоинта и весов...");
+    // 1. Создаем локальный файл-флаг для мгновенной остановки цикла train_gpu.py
+    FILE* f = fopen("train_stop.flag", "w");
+    if (f) {
+        fputs("stop", f);
+        fclose(f);
     }
+    strcpy(s->train_status, "Остановка... Безопасное сохранение чекпоинта и весов...");
+
+    // 2. Отправляем API запрос демону для прерывания и запуска watchdog
+    char resp[512];
+    http_post_json("/api/train/stop", "{}", resp, sizeof(resp));
+
+    // 3. Задержка и немедленный опрос нового статуса
+    Sleep(100);
+    poll_training_status(s);
 }
 
 void poll_training_status(AppState* s) {
@@ -444,7 +584,9 @@ void poll_training_status(AppState* s) {
     if (http_get(DAEMON_HOST "/api/train/status", resp, sizeof(resp))) {
         char* p_run = strstr(resp, "\"running\":");
         if (p_run) {
-            s->train_is_running = (strstr(p_run, "true") != NULL);
+            p_run += 10;
+            while (*p_run == ' ' || *p_run == '\t') p_run++;
+            s->train_is_running = (strncmp(p_run, "true", 4) == 0);
         }
         char* p_step = strstr(resp, "\"step\":");
         if (p_step) s->train_cur_step = atoi(p_step + 7);
@@ -470,7 +612,10 @@ void poll_training_status(AppState* s) {
             while (*p_log == ' ' || *p_log == '\"') p_log++;
             char* end = strrchr(p_log, '\"');
             if (end) *end = '\0';
-            strncpy(s->train_log, p_log, sizeof(s->train_log) - 1);
+            if (strlen(p_log) > 0 && strstr(s->train_log, p_log) == NULL) {
+                int cur_len = (int)strlen(s->train_log);
+                snprintf(s->train_log + cur_len, sizeof(s->train_log) - cur_len, "%s\n", p_log);
+            }
         }
     }
 }
@@ -586,6 +731,9 @@ int main(int argc, char** argv) {
     // Initial state
     memset(&g_state, 0, sizeof(AppState));
     g_state.train_steps = 1000;
+    g_state.use_web = 1;
+    strcpy(g_state.web_status, "Введите поисковый запрос (например: 'что такое larp') или URL для серфинга.");
+    strcpy(g_state.web_results_text, "Здесь отобразятся проверенные факты из сети или текст открытой страницы.\n");
     strcpy(g_state.chat_history, "🤖 KobyakovAI: Привет! Я нативный ИИ с MoE архитектурой (144 экспертные ноды).\nЯ умею писать код, решать математику и НЕПРЕРЫВНО смотреть и обучаться по видео (YouTube, TikTok, IDE) через SmolVLM!\n------------------------------------------------------------\n");
     strcpy(g_state.train_status, "Готов к обучению на GPU RTX 2060");
     strcpy(g_state.system_info, "Модель: Иерархический MoE (144 Экспертные Ноды) | 102.14 M Параметров\nЗрение: SmolVLM-500M-Instruct (CUDA FP16)\nВидеокарта: NVIDIA GeForce RTX 2060 (6.0 GB GDDR6)\nИнтерфейс: Нативный C99 + Nuklear GDI (Скомпилировано через Zig cc)\nПотребление памяти GUI: всего ~8.5 МБ ОЗУ | Без Electron и Node.js\nСтатус демона: 127.0.0.1:8999 (Активен)");
@@ -607,8 +755,9 @@ int main(int argc, char** argv) {
 
         clock_t now = clock();
 
-        // Опрос статуса классического обучения
-        if (g_state.current_tab == 2 && (now - g_state.last_train_poll) > (CLOCKS_PER_SEC * 1.5)) {
+        // Опрос статуса классического обучения (адаптивно: ~300 мс во время обучения, 1.2 с в покое)
+        clock_t train_interval = g_state.train_is_running ? (CLOCKS_PER_SEC / 3) : (CLOCKS_PER_SEC * 1.2);
+        if (g_state.current_tab == 2 && (now - g_state.last_train_poll) > train_interval) {
             poll_training_status(&g_state);
             g_state.last_train_poll = now;
         }
@@ -627,7 +776,7 @@ int main(int argc, char** argv) {
 
         if (nk_begin(ctx, "MainWindow", nk_rect(0, 0, (float)win_w, (float)win_h), NK_WINDOW_NO_SCROLLBAR)) {
             // Навигационные вкладки
-            nk_layout_row_dynamic(ctx, 42, 4);
+            nk_layout_row_dynamic(ctx, 42, 5);
             if (nk_button_label(ctx, g_state.current_tab == 0 ? "💬 ЧАТ MoE [АКТИВЕН]" : "💬 Чат MoE")) g_state.current_tab = 0;
             if (nk_button_label(ctx, g_state.current_tab == 1 ? "👁️ ВИДЕО & ОБУЧЕНИЕ [АКТИВЕН]" : "👁️ Видео & Обучение")) {
                 g_state.current_tab = 1;
@@ -635,7 +784,8 @@ int main(int argc, char** argv) {
                 capture_single_preview(&g_state);
             }
             if (nk_button_label(ctx, g_state.current_tab == 2 ? "🚀 ОБУЧЕНИЕ GPU [АКТИВЕН]" : "🚀 Обучение GPU")) g_state.current_tab = 2;
-            if (nk_button_label(ctx, g_state.current_tab == 3 ? "⚙️ СИСТЕМА [АКТИВЕН]" : "⚙️ Система")) g_state.current_tab = 3;
+            if (nk_button_label(ctx, g_state.current_tab == 3 ? "🌐 ВЕБ-СЕРФИНГ [АКТИВЕН]" : "🌐 Веб-серфинг")) g_state.current_tab = 3;
+            if (nk_button_label(ctx, g_state.current_tab == 4 ? "⚙️ СИСТЕМА [АКТИВЕН]" : "⚙️ Система")) g_state.current_tab = 4;
 
             nk_layout_row_dynamic(ctx, 8, 1);
             nk_spacing(ctx, 1);
@@ -644,11 +794,14 @@ int main(int argc, char** argv) {
             // ВКЛАДКА 0: ЧАТ
             // ==========================================
             if (g_state.current_tab == 0) {
-                nk_layout_row_begin(ctx, NK_STATIC, 32, 4);
-                nk_layout_row_push(ctx, 180);
-                nk_checkbox_label(ctx, "👁️ Включить зрение", &g_state.use_vision);
+                nk_layout_row_begin(ctx, NK_STATIC, 32, 5);
+                nk_layout_row_push(ctx, 150);
+                nk_checkbox_label(ctx, "👁️ Зрение", &g_state.use_vision);
 
-                nk_layout_row_push(ctx, 380);
+                nk_layout_row_push(ctx, 160);
+                nk_checkbox_label(ctx, "🌐 Веб-поиск", &g_state.use_web);
+
+                nk_layout_row_push(ctx, 320);
                 if (g_state.window_count > 0) {
                     g_state.selected_window_idx = nk_combo(ctx, g_state.window_ptrs, g_state.window_count, g_state.selected_window_idx, 25, nk_vec2(380, 200));
                 }
@@ -845,9 +998,61 @@ int main(int argc, char** argv) {
             }
 
             // ==========================================
-            // ВКЛАДКА 3: СИСТЕМА
+            // ВКЛАДКА 3: КОНТРОЛИРУЕМЫЙ ВЕБ-СЕРФИНГ
             // ==========================================
             else if (g_state.current_tab == 3) {
+                nk_layout_row_dynamic(ctx, 26, 1);
+                nk_label(ctx, "🌐 Контролируемый Веб-серфинг & Поисковый Движок KobyakovAI:", NK_TEXT_LEFT);
+
+                // Строка ввода запроса или URL
+                nk_layout_row_begin(ctx, NK_STATIC, 36, 4);
+                nk_layout_row_push(ctx, (float)(win_w - 430));
+                nk_flags res_web_enter = nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD | NK_EDIT_SIG_ENTER, g_state.web_input, sizeof(g_state.web_input), nk_filter_default);
+                if (res_web_enter & NK_EDIT_COMMITED) {
+                    if (strncmp(g_state.web_input, "http", 4) == 0) perform_web_fetch(&g_state);
+                    else perform_web_search(&g_state);
+                }
+
+                nk_layout_row_push(ctx, 140);
+                if (nk_button_label(ctx, g_state.web_is_loading ? "Поиск..." : "🔍 Найти в сети")) {
+                    perform_web_search(&g_state);
+                }
+
+                nk_layout_row_push(ctx, 140);
+                if (nk_button_label(ctx, "🌐 Открыть URL")) {
+                    perform_web_fetch(&g_state);
+                }
+
+                nk_layout_row_push(ctx, 110);
+                if (nk_button_label(ctx, "🗑️ Очистить")) {
+                    g_state.web_input[0] = '\0';
+                    g_state.web_results_text[0] = '\0';
+                    strcpy(g_state.web_status, "Очищено.");
+                }
+                nk_layout_row_end(ctx);
+
+                // Статус
+                nk_layout_row_dynamic(ctx, 22, 1);
+                nk_label(ctx, g_state.web_status, NK_TEXT_LEFT);
+
+                // Просмотр найденных фактов / текста страницы
+                nk_layout_row_dynamic(ctx, (float)(win_h - 230), 1);
+                nk_edit_string_zero_terminated(ctx, NK_EDIT_MULTILINE | NK_EDIT_READ_ONLY, g_state.web_results_text, sizeof(g_state.web_results_text), nk_filter_default);
+
+                // Кнопки взаимодействия
+                nk_layout_row_dynamic(ctx, 38, 2);
+                if (nk_button_label(ctx, "💬 Перенести этот контекст в Чат для обсуждения")) {
+                    send_web_to_chat(&g_state);
+                }
+                if (nk_button_label(ctx, "🧠 Усвоить веб-знания в веса MoE (Обучение)")) {
+                    learn_web_content(&g_state);
+                }
+            }
+
+            // ==========================================
+            // ВКЛАДКА 4: СИСТЕМА
+            // ==========================================
+            else if (g_state.current_tab == 4) {
                 nk_layout_row_dynamic(ctx, 160, 1);
                 nk_edit_string_zero_terminated(ctx, NK_EDIT_MULTILINE | NK_EDIT_READ_ONLY, g_state.system_info, sizeof(g_state.system_info), nk_filter_default);
 

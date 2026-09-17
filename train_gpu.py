@@ -77,12 +77,39 @@ def train_cuda(
     use_amp = (device == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    print(f"\nTraining for {steps} steps on {device.upper()}... (Нажмите Ctrl+C в любой момент для безопасного сохранения)")
+    # Удаляем устаревший флаг остановки перед началом
+    if os.path.exists("train_stop.flag"):
+        try:
+            os.remove("train_stop.flag")
+        except Exception:
+            pass
+
+    stop_requested = False
+    def on_stop_signal(sig=None, frame=None):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, on_stop_signal)
+    signal.signal(signal.SIGTERM, on_stop_signal)
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, on_stop_signal)
+
+    print(f"\nTraining for {steps} steps on {device.upper()}... (Кнопка 'Остановить' в GUI или Ctrl+C сохранит веса)", flush=True)
     model.train()
 
     completed_steps = 0
     try:
         for step in range(1, steps + 1):
+            if stop_requested or os.path.exists("train_stop.flag"):
+                try:
+                    if os.path.exists("train_stop.flag"):
+                        os.remove("train_stop.flag")
+                except Exception:
+                    pass
+                print(f"\n\n\033[93m[⚠️ Остановка по запросу] Обучение прервано на шаге {completed_steps} из {steps}!\033[0m", flush=True)
+                print("\033[93mИдет сохранение накопленного прогресса в веса...\033[0m", flush=True)
+                break
+
             x, y = loader.get_batch()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
@@ -95,7 +122,7 @@ def train_cuda(
             completed_steps = step
 
             if step == 1 or step % 50 == 0 or step == steps:
-                print(f"Step {step:4d} / {steps} | Loss: \033[92m{loss.item():.4f}\033[0m")
+                print(f"Step {step:4d} / {steps} | Loss: \033[92m{loss.item():.4f}\033[0m", flush=True)
 
             # Периодическое автосохранение каждые 250 шагов
             if step % 250 == 0 and step < steps:
@@ -103,30 +130,34 @@ def train_cuda(
                 model.eval()
                 export_model_bin(model, output_bin)
                 model.train()
-                print(f"  \033[90m[Автосохранение чекпоинта и model.bin на шаге {step}]\033[0m")
+                print(f"  \033[90m[Автосохранение чекпоинта и model.bin на шаге {step}]\033[0m", flush=True)
 
-        print("\nTraining completed!")
+        if not stop_requested and not os.path.exists("train_stop.flag") and completed_steps == steps:
+            print("\nTraining completed!", flush=True)
     except KeyboardInterrupt:
-        print(f"\n\n\033[93m[⚠️ Остановка по Ctrl+C] Обучение прервано пользователем на шаге {completed_steps} из {steps}!\033[0m")
-        print("\033[93mИдет сохранение накопленного прогресса в веса...\033[0m")
+        print(f"\n\n\033[93m[⚠️ Остановка по Ctrl+C] Обучение прервано пользователем на шаге {completed_steps} из {steps}!\033[0m", flush=True)
+        print("\033[93mИдет сохранение накопленного прогресса в веса...\033[0m", flush=True)
 
     # Save PyTorch checkpoint and export to C engine
     if completed_steps > 0:
-        # Временно блокируем повторный Ctrl+C во время записи на диск
-        prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # Временно блокируем повторный сигнал во время записи на диск
+        prev_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        prev_sigterm = signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
             torch.save(model.state_dict(), checkpoint_pth)
-            print(f"\033[92m[✓] PyTorch веса сохранены в {checkpoint_pth} (пройдено шагов: {completed_steps})\033[0m")
+            print(f"\033[92m[✓] PyTorch веса сохранены в {checkpoint_pth} (пройдено шагов: {completed_steps})\033[0m", flush=True)
 
             # Export directly to native C model.bin
-            print(f"Экспорт весов в нативный C-движок ({output_bin})...")
+            print(f"Экспорт весов в нативный C-движок ({output_bin})...", flush=True)
             model.eval()
             export_model_bin(model, output_bin)
-            print(f"\033[92m[✓] Все {completed_steps} шагов успешно зафиксированы в model.bin для C-движка!\033[0m")
+            print(f"\033[92m[✓] Все {completed_steps} шагов успешно зафиксированы в model.bin для C-движка!\033[0m", flush=True)
+            print(f"\033[92m[✓] Обучение завершено и безопасно сохранено.\033[0m", flush=True)
         finally:
-            signal.signal(signal.SIGINT, prev_handler)
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
     else:
-        print("Обучение остановлено до первого шага, сохранение пропущено.")
+        print("Обучение остановлено до первого шага, сохранение пропущено.", flush=True)
 
 if __name__ == "__main__":
     import argparse
