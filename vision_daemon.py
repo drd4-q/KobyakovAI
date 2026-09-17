@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  👁️ KobyakovAI Vision & Brain Daemon (Local HTTP API)
-  Backend service for Native C/Zig GUI (kobyakov_gui.exe)
+  👁️ KobyakovAI Vision, Brain & Active Video Learning Daemon
+  Backend service for Native C/Zig GUI (KobyakovAI.exe)
   Runs on 127.0.0.1:8999 with zero external server dependencies.
+  Features:
+    - SmolVLM-500M GPU acceleration (RTX 2060)
+    - Real-Time Continuous Video Stream (no artificial delay)
+    - Active Video Learning (Online MoE Fine-Tuning from video frames)
 ============================================================
 """
 
@@ -12,6 +16,7 @@ import sys
 import json
 import time
 import signal
+import queue
 import subprocess
 import threading
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -34,6 +39,14 @@ vision_lock = threading.Lock()
 brain_model = None
 brain_enc = None
 brain_lock = threading.Lock()
+
+def get_vision_model():
+    global vision_model
+    with vision_lock:
+        if vision_model is None:
+            print('[VisionDaemon] Инициализация SmolVLM-500M на GPU...')
+            vision_model = ScreenVisionModel()
+        return vision_model
 
 def get_brain_model():
     global brain_model, brain_enc
@@ -64,7 +77,237 @@ def get_brain_model():
                 return None, None
         return brain_model, brain_enc
 
-# Training state tracking
+# ============================================================
+# Активное онлайн-дообучение на основе видео (Active Video Learning)
+# ============================================================
+class ActiveVideoLearner:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.model = None
+        self.device = None
+        self.optimizer = None
+        self.scaler = None
+        self.enc = None
+        self.step_count = 0
+        self.current_loss = 0.0
+
+    def _ensure_init(self):
+        if self.model is None:
+            import torch
+            import torch.optim as optim
+            import tiktoken
+            from model import CodeLanguageModel
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.enc = tiktoken.get_encoding("gpt2")
+            self.model = CodeLanguageModel(
+                vocab_size=self.enc.n_vocab,
+                n_embd=256, n_head=8, n_layer=2, block_size=128, dropout=0.05,
+                num_parents=4, num_sub_parents=4, num_leaf_experts=9, top_k=2, mult=2
+            )
+            weights_path = "moe_model_weights.pth"
+            if os.path.exists(weights_path):
+                try:
+                    sd = torch.load(weights_path, map_location=self.device, weights_only=True)
+                    self.model.load_state_dict(sd, strict=False)
+                    print(f"[VideoLearner] Веса MoE загружены для онлайн-дообучения на {self.device.upper()}")
+                except Exception as e:
+                    print(f"[VideoLearner] Ошибка загрузки весов: {e}")
+            self.model.to(self.device)
+            self.model.train()
+            self.optimizer = optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=0.01)
+            self.scaler = torch.amp.GradScaler("cuda", enabled=(self.device == "cuda"))
+
+    def train_sample(self, text):
+        with self.lock:
+            self._ensure_init()
+            import torch
+            tokens = self.enc.encode(text)
+            if len(tokens) < 6:
+                return None
+
+            block_size = 128
+            if len(tokens) < block_size + 1:
+                tokens = tokens + [50256] * (block_size + 1 - len(tokens))
+
+            chunk = tokens[:block_size + 1]
+            x = torch.tensor([chunk[:block_size]], dtype=torch.long, device=self.device)
+            y = torch.tensor([chunk[1:block_size + 1]], dtype=torch.long, device=self.device)
+
+            with torch.amp.autocast("cuda", enabled=(self.device == "cuda")):
+                logits, loss = self.model(x, y)
+
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.step_count += 1
+            loss_val = round(loss.item(), 4)
+            self.current_loss = loss_val
+
+            if self.step_count % 5 == 0:
+                self.save_checkpoint()
+
+            return loss_val
+
+    def save_checkpoint(self):
+        if self.model is not None:
+            import torch
+            torch.save(self.model.state_dict(), "moe_model_weights.pth")
+            try:
+                from export_weights import export_model_bin
+                export_model_bin(self.model, "model.bin")
+            except Exception as e:
+                print(f"[VideoLearner] Ошибка экспорта model.bin: {e}")
+            global brain_model
+            with brain_lock:
+                brain_model = None
+            print(f"[VideoLearner] Веса сохранены (Шаг онлайн-обучения {self.step_count})")
+
+active_learner = ActiveVideoLearner()
+
+# ============================================================
+# Потоковый движок реального времени (Continuous Video Engine)
+# ============================================================
+class ContinuousVideoEngine:
+    def __init__(self, capture_obj, learner_obj):
+        self.capture = capture_obj
+        self.learner = learner_obj
+        self.running = False
+        self.learning_enabled = False
+        self.target = None
+        self.lock = threading.Lock()
+
+        self.frames_captured = 0
+        self.frames_analyzed = 0
+        self.fps = 0.0
+        self.latest_analysis = "Поток не запущен"
+        self.current_loss = 0.0
+        self.training_steps = 0
+        self.learned_log = []
+        self.last_analysis_text = ""
+
+        self.capture_thread = None
+        self.analysis_thread = None
+        self.frame_queue = queue.Queue(maxsize=1)
+
+    def start(self, target=None, hwnd=None, enable_learning=False):
+        with self.lock:
+            self.hwnd = hwnd if (hwnd and isinstance(hwnd, int) and hwnd > 0) else None
+            self.target = target if (target and target != "Весь экран (Desktop Screen)") else None
+            self.learning_enabled = enable_learning
+            if self.running:
+                return
+            self.running = True
+            self.frames_captured = 0
+            self.frames_analyzed = 0
+            self.latest_analysis = "Подключение к видеопотоку..."
+            self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.analysis_thread = threading.Thread(target=self._analysis_loop, daemon=True)
+            self.capture_thread.start()
+            self.analysis_thread.start()
+            print(f"[VideoEngine] Поток запущен. HWND: {self.hwnd}, Заголовок: {self.target}, Обучение: {self.learning_enabled}")
+
+    def stop(self):
+        with self.lock:
+            if not self.running:
+                return
+            self.running = False
+            self.latest_analysis = "Видеопоток остановлен."
+        if self.learning_enabled and self.learner:
+            self.learner.save_checkpoint()
+        print("[VideoEngine] Поток остановлен.")
+
+    def _capture_loop(self):
+        start_t = time.time()
+        fc = 0
+        while self.running:
+            try:
+                target_key = self.hwnd if self.hwnd else self.target
+                im = None
+                if target_key:
+                    im, win = self.capture.capture_window(target_key)
+                if not im:
+                    im = self.capture.capture_screen()
+
+                # Сохраняем кадр для нативного рендеринга в C GUI (20-25 FPS)
+                thumb = im.copy()
+                thumb.thumbnail((480, 270), Image.Resampling.LANCZOS)
+                thumb.save("preview.bmp", "BMP")
+
+                if not self.frame_queue.full():
+                    try:
+                        self.frame_queue.put_nowait(im)
+                    except queue.Full:
+                        pass
+
+                self.frames_captured += 1
+                fc += 1
+                el = time.time() - start_t
+                if el >= 1.0:
+                    self.fps = round(fc / el, 1)
+                    fc = 0
+                    start_t = time.time()
+
+                time.sleep(0.04) # ~25 FPS
+            except Exception:
+                time.sleep(0.08)
+
+    def _analysis_loop(self):
+        while self.running:
+            try:
+                try:
+                    im = self.frame_queue.get(timeout=0.4)
+                except queue.Empty:
+                    continue
+
+                v_model = get_vision_model()
+                if self.learning_enabled:
+                    prompt = (
+                        "Выдели и подробно объясни весь программный код, математику, формулы, алгоритмы или знания на этом кадре. "
+                        "Если виден код, выпиши точный код. Если объяснение или субтитры, сформулируй суть."
+                    )
+                else:
+                    prompt = "Кратко опиши, что сейчас происходит на видео (субтитры, код, действия, элементы интерфейса)."
+
+                analysis = v_model.analyze(im, prompt=prompt)
+                clean = analysis.strip()
+
+                with self.lock:
+                    self.latest_analysis = clean
+                    self.frames_analyzed += 1
+
+                # Обучение по кадрам видео
+                if self.learning_enabled and len(clean) > 15:
+                    if clean != self.last_analysis_text:
+                        self.last_analysis_text = clean
+                        train_text = f"User: Что показано на видео?\n\nKobyakovAI:\n{clean}\n"
+                        loss_val = self.learner.train_sample(train_text)
+                        if loss_val is not None:
+                            now_str = time.strftime("%H:%M:%S")
+                            snippet = clean.replace("\n", " ")[:50]
+                            log_entry = f"[{now_str}] Усвоено: {snippet}... (Loss: {loss_val})"
+                            with self.lock:
+                                self.current_loss = loss_val
+                                self.training_steps = self.learner.step_count
+                                self.learned_log.append(log_entry)
+                                if len(self.learned_log) > 25:
+                                    self.learned_log.pop(0)
+
+                            try:
+                                with open("video_train_dataset.txt", "a", encoding="utf-8") as vf:
+                                    vf.write(train_text + "\n" + ("=" * 40) + "\n")
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"[VideoEngine] Ошибка в цикле анализа: {e}")
+                time.sleep(0.2)
+
+video_engine = ContinuousVideoEngine(capture, active_learner)
+
+# ============================================================
+# Традиционный трекер классического обучения
+# ============================================================
 train_process = None
 train_lock = threading.Lock()
 train_state = {
@@ -75,14 +318,6 @@ train_state = {
     'status': 'Готов к обучению',
     'last_log': ''
 }
-
-def get_vision_model():
-    global vision_model
-    with vision_lock:
-        if vision_model is None:
-            print('[VisionDaemon] Инициализация SmolVLM-500M на GPU...')
-            vision_model = ScreenVisionModel()
-        return vision_model
 
 def train_monitor_thread(proc, steps):
     global train_process, train_state
@@ -101,7 +336,6 @@ def train_monitor_thread(proc, steps):
                     train_state['total_steps'] = int(tot.strip())
                     if len(parts) > 1 and 'Loss:' in parts[1]:
                         loss_val = parts[1].replace('Loss:', '').strip()
-                        # strip ansi color codes if any
                         clean_loss = ''.join(c for c in loss_val if c.isdigit() or c == '.')
                         if clean_loss:
                             train_state['loss'] = float(clean_loss)
@@ -118,13 +352,15 @@ def train_monitor_thread(proc, steps):
         train_process = None
     global brain_model
     with brain_lock:
-        brain_model = None  # Сброс кэша весов для мгновенной перезагрузки
+        brain_model = None
     print('[VisionDaemon] Процесс обучения завершен. Веса перезагружены.')
 
 
+# ============================================================
+# HTTP API Обработчик
+# ============================================================
 class DaemonHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Suppress verbose HTTP logging
         return
 
     def _send_json(self, data, status=200):
@@ -149,6 +385,23 @@ class DaemonHandler(BaseHTTPRequestHandler):
             with train_lock:
                 self._send_json(dict(train_state))
 
+        elif self.path == '/api/video_stream/status':
+            with video_engine.lock:
+                self._send_json({
+                    'status': 'ok',
+                    'streaming': video_engine.running,
+                    'learning': video_engine.learning_enabled,
+                    'target': video_engine.target or 'Весь экран',
+                    'frames_captured': video_engine.frames_captured,
+                    'frames_analyzed': video_engine.frames_analyzed,
+                    'fps': video_engine.fps,
+                    'latest_analysis': video_engine.latest_analysis,
+                    'training_steps': video_engine.training_steps,
+                    'current_loss': video_engine.current_loss,
+                    'learned_count': len(video_engine.learned_log),
+                    'learned_log': '\n'.join(video_engine.learned_log)
+                })
+
         elif self.path == '/api/ping':
             self._send_json({'status': 'ok', 'message': 'KobyakovAI Daemon is active'})
         else:
@@ -162,18 +415,30 @@ class DaemonHandler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
 
-        if self.path == '/api/capture':
+        if self.path == '/api/video_stream/start':
             target = req.get('target', None)
+            hwnd = req.get('hwnd', None)
+            learning = bool(req.get('enable_learning', False))
+            video_engine.start(target=target, hwnd=hwnd, enable_learning=learning)
+            self._send_json({'status': 'ok', 'streaming': True, 'learning': learning})
+
+        elif self.path == '/api/video_stream/stop':
+            video_engine.stop()
+            self._send_json({'status': 'ok', 'streaming': False})
+
+        elif self.path == '/api/capture':
+            target = req.get('target', None)
+            hwnd = req.get('hwnd', None)
+            target_key = hwnd if (hwnd and isinstance(hwnd, int) and hwnd > 0) else target
             im = None
             title = 'Весь экран'
-            if target:
-                im, win = capture.capture_window(target)
+            if target_key and target_key != 'Весь экран (Desktop Screen)':
+                im, win = capture.capture_window(target_key)
                 if win:
                     title = win.title
             if not im:
                 im = capture.capture_screen()
 
-            # Save preview bitmap (BMP for zero-dependency native Windows GDI rendering in C GUI)
             thumb = im.copy()
             thumb.thumbnail((480, 270), Image.Resampling.LANCZOS)
             thumb.save('preview.bmp', 'BMP')
@@ -188,11 +453,13 @@ class DaemonHandler(BaseHTTPRequestHandler):
 
         elif self.path == '/api/analyze':
             target = req.get('target', None)
+            hwnd = req.get('hwnd', None)
+            target_key = hwnd if (hwnd and isinstance(hwnd, int) and hwnd > 0) else target
             prompt = req.get('prompt', 'Опиши подробно, что происходит на видео или в этом окне.')
             im = None
             title = 'Весь экран'
-            if target:
-                im, win = capture.capture_window(target)
+            if target_key and target_key != 'Весь экран (Desktop Screen)':
+                im, win = capture.capture_window(target_key)
                 if win:
                     title = win.title
             if not im:
@@ -212,12 +479,14 @@ class DaemonHandler(BaseHTTPRequestHandler):
             user_prompt = req.get('prompt', '')
             use_vision = req.get('use_vision', False)
             target = req.get('target', None)
+            hwnd = req.get('hwnd', None)
+            target_key = hwnd if (hwnd and isinstance(hwnd, int) and hwnd > 0) else target
 
             visual_context = ''
             if use_vision:
                 im = None
-                if target:
-                    im, win = capture.capture_window(target)
+                if target_key and target_key != 'Весь экран (Desktop Screen)':
+                    im, win = capture.capture_window(target_key)
                 if not im:
                     im = capture.capture_screen()
                 v_model = get_vision_model()
@@ -227,7 +496,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
             full_prompt = f'{visual_context}User: {user_prompt}\n\nKobyakovAI:\n'
             resp = ""
 
-            # 1. Быстрый инференс в памяти через PyTorch MoE
+            # Быстрый инференс в памяти через PyTorch MoE (60 токенов для моментального ответа <3 сек)
             bm, b_enc = get_brain_model()
             if bm is not None and b_enc is not None:
                 try:
@@ -237,12 +506,12 @@ class DaemonHandler(BaseHTTPRequestHandler):
                     x = torch.tensor([input_ids], dtype=torch.long, device=dev)
                     out_tokens = []
                     with torch.no_grad():
-                        for _ in range(120):
+                        for _ in range(60):
                             cond_x = x[:, -128:]
                             with torch.amp.autocast(device_type="cuda", enabled=(dev == "cuda")):
                                 logits, _ = m(cond_x)
                             next_tok = torch.argmax(logits[0, -1, :]).item()
-                            if next_tok in (50256, 12982): # <|endoftext|> or User:
+                            if next_tok in (50256, 12982):
                                 break
                             out_tokens.append(next_tok)
                             x = torch.cat([x, torch.tensor([[next_tok]], device=dev)], dim=1)
@@ -250,7 +519,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"[VisionDaemon] Ошибка ин-мемори инференса: {e}")
 
-            # 2. Фолбэк на native C engine если инференс в памяти не сработал
+            # Фолбэк на C engine
             if not resp:
                 try:
                     proc = subprocess.run(
@@ -287,7 +556,7 @@ class DaemonHandler(BaseHTTPRequestHandler):
 
                 steps = int(req.get('steps', 1000))
                 domain = req.get('domain', 'all')
-                
+
                 cmd = [sys.executable, 'train_gpu.py', '--steps', str(steps), '--domain', domain]
                 train_process = subprocess.Popen(
                     cmd,
@@ -324,8 +593,8 @@ class DaemonHandler(BaseHTTPRequestHandler):
 
 def run_daemon():
     print('=' * 65)
-    print(f'  🚀 KobyakovAI Vision & Brain Daemon running on http://{HOST}:{PORT}')
-    print('  Ready to serve Native C/Zig GUI (kobyakov_gui.exe)')
+    print(f'  🚀 KobyakovAI Vision, Brain & Active Learning Daemon: http://{HOST}:{PORT}')
+    print('  Ready to serve KobyakovAI.exe Studio GUI')
     print('=' * 65)
     server = ThreadingHTTPServer((HOST, PORT), DaemonHandler)
     try:

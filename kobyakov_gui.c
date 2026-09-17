@@ -15,8 +15,8 @@
 #include "nuklear.h"
 #include "nuklear_gdi.h"
 
-#define WINDOW_WIDTH 1100
-#define WINDOW_HEIGHT 740
+#define WINDOW_WIDTH 1150
+#define WINDOW_HEIGHT 780
 #define DAEMON_HOST "http://127.0.0.1:8999"
 
 // ============================================================
@@ -26,7 +26,7 @@ static PROCESS_INFORMATION g_daemon_pi = {0};
 static int g_daemon_started_by_us = 0;
 
 typedef struct {
-    int current_tab; // 0: Chat, 1: Watcher, 2: Training, 3: System
+    int current_tab; // 0: Chat, 1: Watcher & Video Learning, 2: Training, 3: System
 
     // Чат
     char chat_input[512];
@@ -41,15 +41,22 @@ typedef struct {
     int window_count;
     int selected_window_idx;
 
-    // Video Watcher (YouTube / TikTok)
-    int watch_mode;
-    clock_t last_watch_time;
+    // Video Watcher & Active Video Learning
+    int stream_active;
+    int video_learning_active;
+    float stream_fps;
+    int stream_frames;
+    int stream_training_steps;
+    float stream_loss;
+    int stream_learned_count;
     char video_analysis[16384];
+    char stream_learned_log[16384];
     HBITMAP preview_hbm;
     int preview_w;
     int preview_h;
+    clock_t last_stream_poll;
 
-    // Обучение
+    // Классическое обучение
     int train_domain; // 0: all, 1: code, 2: math, 3: logic
     int train_steps;
     int train_is_running;
@@ -74,7 +81,7 @@ int http_get(const char* url, char* out_buf, int max_len) {
     HINTERNET hInternet = InternetOpenA("KobyakovAI", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (!hInternet) return 0;
 
-    DWORD timeout = 2500; // 2.5s timeout
+    DWORD timeout = 2500;
     InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
@@ -100,7 +107,7 @@ int http_post_json(const char* endpoint, const char* json_body, char* out_buf, i
     HINTERNET hInternet = InternetOpenA("KobyakovAI", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (!hInternet) return 0;
 
-    DWORD timeout = 15000; // 15s for AI inference
+    DWORD timeout = 90000; // 90s timeout for AI vision + MoE
     InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
@@ -139,7 +146,7 @@ int http_post_json(const char* endpoint, const char* json_body, char* out_buf, i
 }
 
 // ============================================================
-// Автоматический запуск и управление демоном
+// Автоматический запуск и остановка демона
 // ============================================================
 int is_daemon_alive() {
     char test_buf[256];
@@ -159,16 +166,28 @@ void start_daemon_if_needed() {
     si.wShowWindow = SW_HIDE;
     ZeroMemory(&g_daemon_pi, sizeof(g_daemon_pi));
 
-    char cmd[512] = "python vision_daemon.py";
-    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &g_daemon_pi);
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char* last_slash = strrchr(exe_path, '\\');
+    char exe_dir[MAX_PATH];
+    if (last_slash) {
+        size_t len = last_slash - exe_path;
+        strncpy(exe_dir, exe_path, len);
+        exe_dir[len] = '\0';
+    } else {
+        strcpy(exe_dir, ".");
+    }
+
+    char full_cmd[1024];
+    snprintf(full_cmd, sizeof(full_cmd), "python \"%s\\vision_daemon.py\"", exe_dir);
+    BOOL ok = CreateProcessA(NULL, full_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, exe_dir, &si, &g_daemon_pi);
     if (!ok) {
-        strcpy(cmd, "py vision_daemon.py");
-        ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &g_daemon_pi);
+        snprintf(full_cmd, sizeof(full_cmd), "py \"%s\\vision_daemon.py\"", exe_dir);
+        ok = CreateProcessA(NULL, full_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, exe_dir, &si, &g_daemon_pi);
     }
 
     if (ok) {
         g_daemon_started_by_us = 1;
-        // Ожидаем готовности сервера до 6 секунд
         for (int i = 0; i < 30; i++) {
             Sleep(200);
             if (is_daemon_alive()) {
@@ -211,7 +230,7 @@ void ensure_model_weights() {
 }
 
 // ============================================================
-// Функции взаимодействия с Daemon API
+// API взаимодействия с видеопотоком и обучением
 // ============================================================
 void refresh_windows_list(AppState* s) {
     char resp[16384];
@@ -223,31 +242,37 @@ void refresh_windows_list(AppState* s) {
         s->window_ptrs[0] = s->window_titles[0];
         s->window_count = 1;
 
-        char* p = strstr(resp, "\"title\":");
+        char* p = strstr(resp, "{\"index\":");
         while (p && s->window_count < 38) {
-            p += 8;
-            while (*p == ' ' || *p == '\"') p++;
-            char* end = strchr(p, '\"');
+            int hwnd_val = 0;
+            char* p_hwnd = strstr(p, "\"hwnd\":");
+            if (p_hwnd) hwnd_val = atoi(p_hwnd + 7);
+
+            char* p_title = strstr(p, "\"title\":");
+            if (!p_title) break;
+            p_title += 8;
+            while (*p_title == ' ' || *p_title == '\"') p_title++;
+            char* end = strchr(p_title, '\"');
             if (!end) break;
-            int len = (int)(end - p);
+            int len = (int)(end - p_title);
             if (len > 120) len = 120;
-            strncpy(s->window_titles[s->window_count], p, len);
+            strncpy(s->window_titles[s->window_count], p_title, len);
             s->window_titles[s->window_count][len] = '\0';
+            s->window_hwnds[s->window_count] = hwnd_val;
             s->window_ptrs[s->window_count] = s->window_titles[s->window_count];
             s->window_count++;
-            p = strstr(end, "\"title\":");
+            p = strstr(end, "{\"index\":");
         }
-    } else {
-        s->daemon_online = 0;
     }
 }
 
-void capture_window_preview(AppState* s) {
-    char req[256];
+void capture_single_preview(AppState* s) {
+    char req[512];
+    int hwnd = (s->selected_window_idx > 0) ? s->window_hwnds[s->selected_window_idx] : 0;
     if (s->selected_window_idx <= 0) {
-        strcpy(req, "{\"target\": null}");
+        strcpy(req, "{\"target\": null, \"hwnd\": 0}");
     } else {
-        snprintf(req, sizeof(req), "{\"target\": \"%s\"}", s->window_titles[s->selected_window_idx]);
+        snprintf(req, sizeof(req), "{\"target\": \"%s\", \"hwnd\": %d}", s->window_titles[s->selected_window_idx], hwnd);
     }
     char resp[1024];
     if (http_post_json("/api/capture", req, resp, sizeof(resp))) {
@@ -261,28 +286,96 @@ void capture_window_preview(AppState* s) {
     }
 }
 
-void analyze_window_action(AppState* s, const char* prompt) {
-    capture_window_preview(s);
-    char req[1024];
+void start_video_stream(AppState* s, int with_learning) {
+    char req[512];
+    int hwnd = (s->selected_window_idx > 0) ? s->window_hwnds[s->selected_window_idx] : 0;
     const char* win = (s->selected_window_idx <= 0) ? "" : s->window_titles[s->selected_window_idx];
-    snprintf(req, sizeof(req), "{\"target\": \"%s\", \"prompt\": \"%s\"}", win, prompt);
+    snprintf(req, sizeof(req), "{\"target\": \"%s\", \"hwnd\": %d, \"enable_learning\": %s}",
+             win, hwnd, with_learning ? "true" : "false");
+    char resp[512];
+    if (http_post_json("/api/video_stream/start", req, resp, sizeof(resp))) {
+        s->stream_active = 1;
+        s->video_learning_active = with_learning;
+    }
+}
 
-    char resp[16384];
-    if (http_post_json("/api/analyze", req, resp, sizeof(resp))) {
-        char* p = strstr(resp, "\"analysis\":");
-        if (p) {
-            p += 11;
-            while (*p == ' ' || *p == '\"') p++;
-            char* end = strrchr(p, '\"');
-            if (end) *end = '\0';
-            char clean[8192];
-            int ci = 0;
-            for (int i = 0; p[i] && ci < 8100; i++) {
-                if (p[i] == '\\' && p[i+1] == 'n') { clean[ci++] = '\n'; i++; }
-                else clean[ci++] = p[i];
+void stop_video_stream(AppState* s) {
+    char resp[512];
+    if (http_post_json("/api/video_stream/stop", "{}", resp, sizeof(resp))) {
+        s->stream_active = 0;
+        s->video_learning_active = 0;
+    }
+}
+
+void poll_video_stream_status(AppState* s) {
+    char resp[32768];
+    if (http_get(DAEMON_HOST "/api/video_stream/status", resp, sizeof(resp))) {
+        char* p_stream = strstr(resp, "\"streaming\":");
+        if (p_stream) s->stream_active = (strstr(p_stream, "true") != NULL);
+        char* p_learn = strstr(resp, "\"learning\":");
+        if (p_learn) s->video_learning_active = (strstr(p_learn, "true") != NULL);
+        char* p_fps = strstr(resp, "\"fps\":");
+        if (p_fps) s->stream_fps = (float)atof(p_fps + 6);
+        char* p_fa = strstr(resp, "\"frames_analyzed\":");
+        if (p_fa) s->stream_frames = atoi(p_fa + 18);
+        char* p_steps = strstr(resp, "\"training_steps\":");
+        if (p_steps) s->stream_training_steps = atoi(p_steps + 17);
+        char* p_loss = strstr(resp, "\"current_loss\":");
+        if (p_loss) s->stream_loss = (float)atof(p_loss + 15);
+        char* p_count = strstr(resp, "\"learned_count\":");
+        if (p_count) s->stream_learned_count = atoi(p_count + 16);
+
+        // Анализ текущего кадра
+        char* p_la = strstr(resp, "\"latest_analysis\":");
+        if (p_la) {
+            p_la += 18;
+            while (*p_la == ' ' || *p_la == '\"') p_la++;
+            char* end = strchr(p_la, '\"');
+            if (end) {
+                int len = (int)(end - p_la);
+                if (len > 8000) len = 8000;
+                char clean[8192];
+                int ci = 0;
+                for (int i = 0; i < len && ci < 8100; i++) {
+                    if (p_la[i] == '\\' && p_la[i+1] == 'n') { clean[ci++] = '\n'; i++; }
+                    else if (p_la[i] == '\\' && p_la[i+1] == '\"') { clean[ci++] = '\"'; i++; }
+                    else clean[ci++] = p_la[i];
+                }
+                clean[ci] = '\0';
+                strncpy(s->video_analysis, clean, sizeof(s->video_analysis) - 1);
             }
-            clean[ci] = '\0';
-            snprintf(s->video_analysis, sizeof(s->video_analysis), "=== КАДР: [%s] ===\n%s\n", win[0] ? win : "Весь экран", clean);
+        }
+
+        // Лог выученного из видео
+        char* p_log = strstr(resp, "\"learned_log\":");
+        if (p_log) {
+            p_log += 14;
+            while (*p_log == ' ' || *p_log == '\"') p_log++;
+            char* end = strrchr(p_log, '\"');
+            if (end) {
+                int len = (int)(end - p_log);
+                if (len > 12000) len = 12000;
+                char clean[16384];
+                int ci = 0;
+                for (int i = 0; i < len && ci < 16000; i++) {
+                    if (p_log[i] == '\\' && p_log[i+1] == 'n') { clean[ci++] = '\n'; i++; }
+                    else if (p_log[i] == '\\' && p_log[i+1] == '\"') { clean[ci++] = '\"'; i++; }
+                    else clean[ci++] = p_log[i];
+                }
+                clean[ci] = '\0';
+                strncpy(s->stream_learned_log, clean, sizeof(s->stream_learned_log) - 1);
+            }
+        }
+
+        // Обновление превью в реальном времени (GDI DIB)
+        if (s->stream_active) {
+            HBITMAP hbm = (HBITMAP)LoadImageA(NULL, "preview.bmp", IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+            if (hbm) {
+                if (s->preview_hbm) DeleteObject(s->preview_hbm);
+                s->preview_hbm = hbm;
+                s->preview_w = 480;
+                s->preview_h = 270;
+            }
         }
     }
 }
@@ -294,9 +387,10 @@ void send_chat_message(AppState* s) {
     snprintf(s->chat_history + cur_len, sizeof(s->chat_history) - cur_len, "\nПользователь: %s\n\n🤖 KobyakovAI:\n", s->chat_input);
 
     char req[2048];
+    int hwnd = (s->use_vision && s->selected_window_idx > 0) ? s->window_hwnds[s->selected_window_idx] : 0;
     const char* win = (s->use_vision && s->selected_window_idx > 0) ? s->window_titles[s->selected_window_idx] : "";
-    snprintf(req, sizeof(req), "{\"prompt\": \"%s\", \"use_vision\": %s, \"target\": \"%s\"}",
-             s->chat_input, s->use_vision ? "true" : "false", win);
+    snprintf(req, sizeof(req), "{\"prompt\": \"%s\", \"use_vision\": %s, \"target\": \"%s\", \"hwnd\": %d}",
+             s->chat_input, s->use_vision ? "true" : "false", win, hwnd);
 
     s->chat_input[0] = '\0';
     s->is_thinking = 1;
@@ -397,7 +491,6 @@ static LRESULT CALLBACK WindowProc(HWND wnd, UINT msg, WPARAM wparam, LPARAM lpa
 }
 
 int main(int argc, char** argv) {
-    // Поддержка CLI аргументов в автономном exe
     if (argc > 1) {
         if (strcmp(argv[1], "--cli") == 0 || strcmp(argv[1], "-c") == 0) {
             AttachConsole(ATTACH_PARENT_PROCESS);
@@ -428,8 +521,6 @@ int main(int argc, char** argv) {
     }
 
     SetProcessDPIAware();
-
-    // Проверяем веса модели и фоновый сервис
     ensure_model_weights();
     start_daemon_if_needed();
 
@@ -445,14 +536,14 @@ int main(int argc, char** argv) {
     wc.hInstance = GetModuleHandleW(0);
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = L"KobyakovStudioMainClass";
+    wc.lpszClassName = L"KobyakovStudioV2Class";
     RegisterClassW(&wc);
 
     wnd = CreateWindowW(
         wc.lpszClassName,
-        L"🤖 KobyakovAI Native Studio (Pure C99 / Zig MoE + Vision)",
+        L"🤖 KobyakovAI Native Studio (144 MoE Nodes + Realtime Vision & Video Learning)",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        100, 60, WINDOW_WIDTH, WINDOW_HEIGHT,
+        80, 40, WINDOW_WIDTH, WINDOW_HEIGHT,
         NULL, NULL, wc.hInstance, NULL
     );
 
@@ -460,44 +551,46 @@ int main(int argc, char** argv) {
     GdiFont* font = nk_gdifont_create("Segoe UI", 16);
     ctx = nk_gdi_init(font, dc, WINDOW_WIDTH, WINDOW_HEIGHT);
 
-    // Тема оформления (Modern Dark)
+    // Dark Theme Setup
     struct nk_color table[NK_COLOR_COUNT];
     table[NK_COLOR_TEXT] = nk_rgba(230, 230, 230, 255);
-    table[NK_COLOR_WINDOW] = nk_rgba(22, 24, 28, 255);
-    table[NK_COLOR_HEADER] = nk_rgba(32, 36, 43, 255);
-    table[NK_COLOR_BORDER] = nk_rgba(45, 50, 60, 255);
-    table[NK_COLOR_BUTTON] = nk_rgba(36, 40, 48, 255);
-    table[NK_COLOR_BUTTON_HOVER] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_BUTTON_ACTIVE] = nk_rgba(55, 125, 210, 255);
-    table[NK_COLOR_TOGGLE] = nk_rgba(40, 45, 54, 255);
-    table[NK_COLOR_TOGGLE_HOVER] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_TOGGLE_CURSOR] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_SELECT] = nk_rgba(36, 40, 48, 255);
-    table[NK_COLOR_SELECT_ACTIVE] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_SLIDER] = nk_rgba(40, 45, 54, 255);
-    table[NK_COLOR_SLIDER_CURSOR] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgba(95, 165, 250, 255);
-    table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgba(65, 135, 220, 255);
-    table[NK_COLOR_PROPERTY] = nk_rgba(30, 34, 40, 255);
-    table[NK_COLOR_EDIT] = nk_rgba(26, 29, 35, 255);
+    table[NK_COLOR_WINDOW] = nk_rgba(20, 22, 26, 255);
+    table[NK_COLOR_HEADER] = nk_rgba(30, 34, 42, 255);
+    table[NK_COLOR_BORDER] = nk_rgba(45, 52, 64, 255);
+    table[NK_COLOR_BUTTON] = nk_rgba(35, 40, 50, 255);
+    table[NK_COLOR_BUTTON_HOVER] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_BUTTON_ACTIVE] = nk_rgba(50, 120, 210, 255);
+    table[NK_COLOR_TOGGLE] = nk_rgba(38, 44, 54, 255);
+    table[NK_COLOR_TOGGLE_HOVER] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_TOGGLE_CURSOR] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_SELECT] = nk_rgba(35, 40, 50, 255);
+    table[NK_COLOR_SELECT_ACTIVE] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_SLIDER] = nk_rgba(38, 44, 54, 255);
+    table[NK_COLOR_SLIDER_CURSOR] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_SLIDER_CURSOR_HOVER] = nk_rgba(90, 160, 250, 255);
+    table[NK_COLOR_SLIDER_CURSOR_ACTIVE] = nk_rgba(60, 130, 220, 255);
+    table[NK_COLOR_PROPERTY] = nk_rgba(28, 32, 40, 255);
+    table[NK_COLOR_EDIT] = nk_rgba(24, 27, 34, 255);
     table[NK_COLOR_EDIT_CURSOR] = nk_rgba(230, 230, 230, 255);
-    table[NK_COLOR_COMBO] = nk_rgba(32, 36, 43, 255);
-    table[NK_COLOR_CHART] = nk_rgba(32, 36, 43, 255);
-    table[NK_COLOR_CHART_COLOR] = nk_rgba(75, 145, 230, 255);
+    table[NK_COLOR_COMBO] = nk_rgba(30, 34, 42, 255);
+    table[NK_COLOR_CHART] = nk_rgba(30, 34, 42, 255);
+    table[NK_COLOR_CHART_COLOR] = nk_rgba(70, 140, 230, 255);
     table[NK_COLOR_CHART_COLOR_HIGHLIGHT] = nk_rgba(240, 180, 80, 255);
-    table[NK_COLOR_SCROLLBAR] = nk_rgba(26, 29, 35, 255);
-    table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgba(50, 56, 66, 255);
-    table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgba(70, 77, 90, 255);
-    table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgba(75, 145, 230, 255);
-    table[NK_COLOR_TAB_HEADER] = nk_rgba(32, 36, 43, 255);
+    table[NK_COLOR_SCROLLBAR] = nk_rgba(24, 27, 34, 255);
+    table[NK_COLOR_SCROLLBAR_CURSOR] = nk_rgba(48, 55, 68, 255);
+    table[NK_COLOR_SCROLLBAR_CURSOR_HOVER] = nk_rgba(68, 77, 94, 255);
+    table[NK_COLOR_SCROLLBAR_CURSOR_ACTIVE] = nk_rgba(70, 140, 230, 255);
+    table[NK_COLOR_TAB_HEADER] = nk_rgba(30, 34, 42, 255);
     nk_style_from_table(ctx, table);
 
-    // Начальное состояние
+    // Initial state
     memset(&g_state, 0, sizeof(AppState));
     g_state.train_steps = 1000;
-    strcpy(g_state.chat_history, "🤖 KobyakovAI: Привет! Я нативный ИИ-ассистент с MoE архитектурой (144 экспертные ноды).\nЯ умею писать код, решать задачи и смотреть любые открытые окна (YouTube, TikTok, IDE, экран) через SmolVLM!\n------------------------------------------------------------\n");
+    strcpy(g_state.chat_history, "🤖 KobyakovAI: Привет! Я нативный ИИ с MoE архитектурой (144 экспертные ноды).\nЯ умею писать код, решать математику и НЕПРЕРЫВНО смотреть и обучаться по видео (YouTube, TikTok, IDE) через SmolVLM!\n------------------------------------------------------------\n");
     strcpy(g_state.train_status, "Готов к обучению на GPU RTX 2060");
     strcpy(g_state.system_info, "Модель: Иерархический MoE (144 Экспертные Ноды) | 102.14 M Параметров\nЗрение: SmolVLM-500M-Instruct (CUDA FP16)\nВидеокарта: NVIDIA GeForce RTX 2060 (6.0 GB GDDR6)\nИнтерфейс: Нативный C99 + Nuklear GDI (Скомпилировано через Zig cc)\nПотребление памяти GUI: всего ~8.5 МБ ОЗУ | Без Electron и Node.js\nСтатус демона: 127.0.0.1:8999 (Активен)");
+    strcpy(g_state.video_analysis, "Видеопоток не активен. Выберите окно и нажмите '▶ Потоковое зрение' или '🎓 Обучение по видео'.");
+    strcpy(g_state.stream_learned_log, "Ожидание запуска обучения по видео...\n");
 
     refresh_windows_list(&g_state);
 
@@ -512,20 +605,21 @@ int main(int argc, char** argv) {
         }
         nk_input_end(ctx);
 
-        // Периодический опрос обучения
         clock_t now = clock();
+
+        // Опрос статуса классического обучения
         if (g_state.current_tab == 2 && (now - g_state.last_train_poll) > (CLOCKS_PER_SEC * 1.5)) {
             poll_training_status(&g_state);
             g_state.last_train_poll = now;
         }
 
-        // Авто-захват кадра в режиме Live Video Watcher
-        if (g_state.watch_mode && (now - g_state.last_watch_time) > (CLOCKS_PER_SEC * 3)) {
-            analyze_window_action(&g_state, "Опиши кратко, что сейчас происходит на видео (субтитры, действия, код).");
-            g_state.last_watch_time = now;
+        // Высокоскоростной опрос видеопотока и онлайн-обучения (без 3-секундной паузы!)
+        if (g_state.current_tab == 1 && (now - g_state.last_stream_poll) > (CLOCKS_PER_SEC / 15)) {
+            poll_video_stream_status(&g_state);
+            g_state.last_stream_poll = now;
         }
 
-        // Отрисовка интерфейса
+        // Размеры окна
         RECT rect;
         GetClientRect(wnd, &rect);
         int win_w = rect.right - rect.left;
@@ -535,12 +629,12 @@ int main(int argc, char** argv) {
             // Навигационные вкладки
             nk_layout_row_dynamic(ctx, 42, 4);
             if (nk_button_label(ctx, g_state.current_tab == 0 ? "💬 ЧАТ MoE [АКТИВЕН]" : "💬 Чат MoE")) g_state.current_tab = 0;
-            if (nk_button_label(ctx, g_state.current_tab == 1 ? "👁️ ВИДЕО [АКТИВЕН]" : "👁️ Video Watcher")) {
+            if (nk_button_label(ctx, g_state.current_tab == 1 ? "👁️ ВИДЕО & ОБУЧЕНИЕ [АКТИВЕН]" : "👁️ Видео & Обучение")) {
                 g_state.current_tab = 1;
                 refresh_windows_list(&g_state);
-                capture_window_preview(&g_state);
+                capture_single_preview(&g_state);
             }
-            if (nk_button_label(ctx, g_state.current_tab == 2 ? "🚀 ОБУЧЕНИЕ [АКТИВЕН]" : "🚀 Обучение GPU")) g_state.current_tab = 2;
+            if (nk_button_label(ctx, g_state.current_tab == 2 ? "🚀 ОБУЧЕНИЕ GPU [АКТИВЕН]" : "🚀 Обучение GPU")) g_state.current_tab = 2;
             if (nk_button_label(ctx, g_state.current_tab == 3 ? "⚙️ СИСТЕМА [АКТИВЕН]" : "⚙️ Система")) g_state.current_tab = 3;
 
             nk_layout_row_dynamic(ctx, 8, 1);
@@ -550,14 +644,13 @@ int main(int argc, char** argv) {
             // ВКЛАДКА 0: ЧАТ
             // ==========================================
             if (g_state.current_tab == 0) {
-                // Панель зрения
                 nk_layout_row_begin(ctx, NK_STATIC, 32, 4);
                 nk_layout_row_push(ctx, 180);
                 nk_checkbox_label(ctx, "👁️ Включить зрение", &g_state.use_vision);
 
-                nk_layout_row_push(ctx, 360);
+                nk_layout_row_push(ctx, 380);
                 if (g_state.window_count > 0) {
-                    g_state.selected_window_idx = nk_combo(ctx, g_state.window_ptrs, g_state.window_count, g_state.selected_window_idx, 25, nk_vec2(360, 200));
+                    g_state.selected_window_idx = nk_combo(ctx, g_state.window_ptrs, g_state.window_count, g_state.selected_window_idx, 25, nk_vec2(380, 200));
                 }
 
                 nk_layout_row_push(ctx, 140);
@@ -591,59 +684,92 @@ int main(int argc, char** argv) {
             }
 
             // ==========================================
-            // ВКЛАДКА 1: VIDEO WATCHER (YouTube / TikTok)
+            // ВКЛАДКА 1: ВИДЕО & ОНЛАЙН-ОБУЧЕНИЕ
             // ==========================================
             else if (g_state.current_tab == 1) {
-                nk_layout_row_begin(ctx, NK_STATIC, 32, 4);
-                nk_layout_row_push(ctx, 360);
+                // Панель управления видеопотоком
+                nk_layout_row_begin(ctx, NK_STATIC, 34, 5);
+                nk_layout_row_push(ctx, 320);
                 if (g_state.window_count > 0) {
                     int prev_idx = g_state.selected_window_idx;
-                    g_state.selected_window_idx = nk_combo(ctx, g_state.window_ptrs, g_state.window_count, g_state.selected_window_idx, 25, nk_vec2(360, 200));
+                    g_state.selected_window_idx = nk_combo(ctx, g_state.window_ptrs, g_state.window_count, g_state.selected_window_idx, 25, nk_vec2(320, 200));
                     if (g_state.selected_window_idx != prev_idx) {
-                        capture_window_preview(&g_state);
+                        capture_single_preview(&g_state);
                     }
                 }
-                nk_layout_row_push(ctx, 140);
-                if (nk_button_label(ctx, "📷 Снимок окна")) {
-                    capture_window_preview(&g_state);
-                    analyze_window_action(&g_state, "Опиши подробно, что видно в этом окне/на видео.");
+
+                nk_layout_row_push(ctx, 120);
+                if (nk_button_label(ctx, "📷 Снимок")) {
+                    capture_single_preview(&g_state);
                 }
-                nk_layout_row_push(ctx, 230);
-                if (g_state.watch_mode) {
-                    if (nk_button_label(ctx, "⏹ Остановить видео-режим")) {
-                        g_state.watch_mode = 0;
+
+                nk_layout_row_push(ctx, 210);
+                if (g_state.stream_active && !g_state.video_learning_active) {
+                    if (nk_button_label(ctx, "⏹ Остановить поток")) {
+                        stop_video_stream(&g_state);
                     }
                 } else {
-                    if (nk_button_label(ctx, "▶ Смотреть видео (Live 3s)")) {
-                        g_state.watch_mode = 1;
-                        g_state.last_watch_time = clock() - (CLOCKS_PER_SEC * 5);
+                    if (nk_button_label(ctx, "▶ Потоковое зрение")) {
+                        start_video_stream(&g_state, 0);
                     }
                 }
+
+                nk_layout_row_push(ctx, 260);
+                if (g_state.stream_active && g_state.video_learning_active) {
+                    if (nk_button_label(ctx, "⏹ ОСТАНОВИТЬ ОБУЧЕНИЕ")) {
+                        stop_video_stream(&g_state);
+                    }
+                } else {
+                    if (nk_button_label(ctx, "🎓 ОБУЧЕНИЕ ПО ВИДЕО (GPU)")) {
+                        start_video_stream(&g_state, 1);
+                    }
+                }
+
                 nk_layout_row_push(ctx, 140);
                 if (nk_button_label(ctx, "🔄 Обновить окна")) {
                     refresh_windows_list(&g_state);
                 }
                 nk_layout_row_end(ctx);
 
-                // Превью и текстовый разбор бок о бок
-                nk_layout_row_dynamic(ctx, (float)(win_h - 130), 2);
+                // Строка живой телеметрии
+                nk_layout_row_dynamic(ctx, 25, 1);
+                char telem_buf[256];
+                if (g_state.stream_active) {
+                    snprintf(telem_buf, sizeof(telem_buf),
+                             "● В ЭФИРЕ: %.1f FPS | Кадров разобрано: %d | Обучение: %s | Усвоено знаний: %d сэмплов | Шаг MoE: %d | Loss: %.4f",
+                             g_state.stream_fps, g_state.stream_frames,
+                             g_state.video_learning_active ? "АКТИВНО" : "ВЫКЛ",
+                             g_state.stream_learned_count, g_state.stream_training_steps, g_state.stream_loss);
+                } else {
+                    strcpy(telem_buf, "○ Видеопоток остановлен. Нажмите '▶ Потоковое зрение' или '🎓 ОБУЧЕНИЕ ПО ВИДЕО (GPU)'.");
+                }
+                nk_label(ctx, telem_buf, NK_TEXT_LEFT);
 
-                // Левая колонка: Описание видео от SmolVLM
-                if (nk_group_begin(ctx, "VideoAnalysisGroup", NK_WINDOW_BORDER)) {
-                    nk_layout_row_dynamic(ctx, 25, 1);
-                    nk_label(ctx, "🧠 Разбор происходящего на видео (SmolVLM):", NK_TEXT_LEFT);
-                    nk_layout_row_dynamic(ctx, (float)(win_h - 190), 1);
+                // Двухколоночный интерфейс: Анализ + Лента знаний слева, Видео справа
+                nk_layout_row_dynamic(ctx, (float)(win_h - 160), 2);
+
+                // Левая колонка: Анализ + Выученные знания
+                if (nk_group_begin(ctx, "VisionStreamGroup", NK_WINDOW_BORDER)) {
+                    nk_layout_row_dynamic(ctx, 24, 1);
+                    nk_label(ctx, "🧠 Разбор происходящего на видео в реальном времени (SmolVLM):", NK_TEXT_LEFT);
+                    nk_layout_row_dynamic(ctx, (float)((win_h - 160) * 0.40), 1);
                     nk_edit_string_zero_terminated(ctx, NK_EDIT_MULTILINE | NK_EDIT_READ_ONLY, g_state.video_analysis, sizeof(g_state.video_analysis), nk_filter_default);
+
+                    nk_layout_row_dynamic(ctx, 24, 1);
+                    nk_label(ctx, "📚 Журнал усвоенных знаний из видео (Active Learning Stream):", NK_TEXT_LEFT);
+                    nk_layout_row_dynamic(ctx, (float)((win_h - 160) * 0.45), 1);
+                    nk_edit_string_zero_terminated(ctx, NK_EDIT_MULTILINE | NK_EDIT_READ_ONLY, g_state.stream_learned_log, sizeof(g_state.stream_learned_log), nk_filter_default);
+
                     nk_group_end(ctx);
                 }
 
-                // Правая колонка: Кадр видео
-                if (nk_group_begin(ctx, "PreviewGroup", NK_WINDOW_BORDER)) {
-                    nk_layout_row_dynamic(ctx, 25, 1);
-                    nk_label(ctx, "📺 Текущий кадр окна / экрана:", NK_TEXT_LEFT);
-                    nk_layout_row_dynamic(ctx, 25, 1);
+                // Правая колонка: Живой видеокадр (GDI Bitmap)
+                if (nk_group_begin(ctx, "VideoMirrorGroup", NK_WINDOW_BORDER)) {
+                    nk_layout_row_dynamic(ctx, 24, 1);
+                    nk_label(ctx, "📺 Живой кадр (Real-Time Video Mirror):", NK_TEXT_LEFT);
+                    nk_layout_row_dynamic(ctx, 22, 1);
                     char info_buf[140];
-                    snprintf(info_buf, sizeof(info_buf), "Окно: %s", g_state.window_titles[g_state.selected_window_idx]);
+                    snprintf(info_buf, sizeof(info_buf), "Источник: %s", g_state.window_titles[g_state.selected_window_idx]);
                     nk_label(ctx, info_buf, NK_TEXT_LEFT);
 
                     if (g_state.preview_hbm) {
@@ -652,14 +778,14 @@ int main(int argc, char** argv) {
                         nk_image(ctx, img);
                     } else {
                         nk_layout_row_dynamic(ctx, 120, 1);
-                        nk_label(ctx, "Нажмите 'Снимок окна' или 'Смотреть видео' для вывода кадра.", NK_TEXT_CENTERED);
+                        nk_label(ctx, "Нажмите 'Потоковое зрение' или 'Обучение по видео' для запуска отображения.", NK_TEXT_CENTERED);
                     }
                     nk_group_end(ctx);
                 }
             }
 
             // ==========================================
-            // ВКЛАДКА 2: ОБУЧЕНИЕ
+            // ВКЛАДКА 2: КЛАССИЧЕСКОЕ ОБУЧЕНИЕ
             // ==========================================
             else if (g_state.current_tab == 2) {
                 nk_layout_row_dynamic(ctx, 30, 1);
@@ -731,15 +857,15 @@ int main(int argc, char** argv) {
                 nk_layout_row_dynamic(ctx, 40, 3);
                 if (nk_button_label(ctx, "⚡ Собрать x86_64 Windows")) {
                     system("zig cc -O3 engine.c -o engine_c.exe");
-                    MessageBoxA(wnd, "engine_c.exe успешно пересобран!", "Zig Compiler", MB_OK | MB_ICONINFORMATION);
+                    MessageBoxW(wnd, L"engine_c.exe успешно пересобран!", L"Zig Compiler", MB_OK | MB_ICONINFORMATION);
                 }
                 if (nk_button_label(ctx, "🍏 Собрать ARM64 (Apple / Pi)")) {
                     system("zig cc -O3 engine.c -target aarch64-linux -o engine_arm64");
-                    MessageBoxA(wnd, "engine_arm64 успешно собран!", "Zig Compiler", MB_OK | MB_ICONINFORMATION);
+                    MessageBoxW(wnd, L"engine_arm64 успешно собран!", L"Zig Compiler", MB_OK | MB_ICONINFORMATION);
                 }
                 if (nk_button_label(ctx, "📟 Собрать RISC-V")) {
                     system("zig cc -O3 engine.c -target riscv64-linux -o engine_riscv64");
-                    MessageBoxA(wnd, "engine_riscv64 успешно собран!", "Zig Compiler", MB_OK | MB_ICONINFORMATION);
+                    MessageBoxW(wnd, L"engine_riscv64 успешно собран!", L"Zig Compiler", MB_OK | MB_ICONINFORMATION);
                 }
 
                 nk_layout_row_dynamic(ctx, 15, 1);
@@ -754,14 +880,14 @@ int main(int argc, char** argv) {
                     Sleep(500);
                     start_daemon_if_needed();
                     refresh_windows_list(&g_state);
-                    MessageBoxA(wnd, "Демон успешно перезапущен!", "KobyakovAI", MB_OK | MB_ICONINFORMATION);
+                    MessageBoxW(wnd, L"Демон успешно перезапущен!", L"KobyakovAI", MB_OK | MB_ICONINFORMATION);
                 }
             }
         }
         nk_end(ctx);
 
-        nk_gdi_render(nk_rgb(22, 24, 28));
-        Sleep(16); // ~60 FPS, 0% CPU consumption
+        nk_gdi_render(nk_rgb(20, 22, 26));
+        Sleep(16); // ~60 FPS
     }
 
     cleanup_daemon();

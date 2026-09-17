@@ -146,33 +146,65 @@ class ScreenCapture:
 
     def capture_window(self, target) -> Tuple[Optional[Image.Image], Optional[WindowInfo]]:
         """
-        Захватывает конкретное окно:
-        - target может быть числом (индекс окна 1, 2, ...), HWND, или строкой (часть названия окна).
+        Захватывает конкретное окно с поддержкой HWND и аппаратного ускорения Chrome/YouTube:
+        - target может быть HWND (int), строкой HWND, индексом окна или строкой заголовка.
+        - Использует высокоскоростной DWM Screen BitBlt (захватывает 60 FPS аппаратное видео в Chrome/YouTube без черных экранов)
+        - С автоматическим фолбэком на PrintWindow(PW_RENDERFULLCONTENT).
         """
         self._ensure_user_desktop()
         windows = self.list_windows()
         selected: Optional[WindowInfo] = None
 
+        # 1. Поиск по HWND или индексу
         if isinstance(target, int):
             for w in windows:
-                if w.index == target or w.hwnd == target:
+                if w.hwnd == target or w.index == target:
                     selected = w
                     break
+            # Если окно не найдено в списке, но HWND валиден в Windows
+            if not selected and user32.IsWindow(target):
+                rect = wintypes.RECT()
+                user32.GetWindowRect(target, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                length = user32.GetWindowTextLengthW(target)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(target, buf, length + 1)
+                selected = WindowInfo(0, target, buf.value, w, h)
+
         elif isinstance(target, str):
-            target_lower = target.lower()
-            # Try exact index first if string is digit
-            if target.isdigit():
-                idx_target = int(target)
+            target_strip = target.strip()
+            if target_strip.isdigit():
+                num = int(target_strip)
                 for w in windows:
-                    if w.index == idx_target:
+                    if w.hwnd == num or w.index == num:
                         selected = w
                         break
+                if not selected and user32.IsWindow(num):
+                    rect = wintypes.RECT()
+                    user32.GetWindowRect(num, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    length = user32.GetWindowTextLengthW(num)
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(num, buf, length + 1)
+                    selected = WindowInfo(0, num, buf.value, w, h)
+
             if not selected:
-                # Search by title substring
+                target_lower = target_strip.lower()
+                # 1. Точное или частичное совпадение
                 for w in windows:
                     if target_lower in w.title.lower():
                         selected = w
                         break
+                # 2. Нечеткое совпадение по ключевым словам (YouTube, Chrome, TikTok, Discord)
+                if not selected:
+                    keywords = [k for k in ["youtube", "chrome", "tiktok", "discord", "code", "visual studio"] if k in target_lower]
+                    if keywords:
+                        for w in windows:
+                            if any(k in w.title.lower() for k in keywords):
+                                selected = w
+                                break
 
         if not selected:
             return None, None
@@ -180,37 +212,83 @@ class ScreenCapture:
         hwnd = selected.hwnd
         tw = selected.width
         th = selected.height
+        if tw <= 10 or th <= 10:
+            return None, selected
 
-        hdc_wnd = user32.GetDC(hwnd)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_wnd)
-        hbm = gdi32.CreateCompatibleBitmap(hdc_wnd, tw, th)
-        old_bm = gdi32.SelectObject(hdc_mem, hbm)
+        im = None
 
-        # PW_RENDERFULLCONTENT = 2 (работает даже если окно перекрыто или на заднем плане)
-        res = user32.PrintWindow(hwnd, hdc_mem, 2)
-        if not res:
-            # Fallback to standard PrintWindow
-            user32.PrintWindow(hwnd, hdc_mem, 0)
+        # Способ 1: Высокоскоростной DWM Screen BitBlt (захватывает live видео YouTube/Chrome на 60 FPS)
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        wx = rect.left
+        wy = rect.top
+        ww = rect.right - rect.left
+        wh = rect.bottom - rect.top
 
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = tw
-        bmi.biHeight = -th # top-down image
-        bmi.biPlanes = 1
-        bmi.biBitCount = 32
-        bmi.biCompression = 0
+        if not user32.IsIconic(hwnd) and ww > 40 and wh > 40:
+            try:
+                hdc_screen = user32.GetDC(None)
+                hdc_mem_screen = gdi32.CreateCompatibleDC(hdc_screen)
+                hbm_screen = gdi32.CreateCompatibleBitmap(hdc_screen, ww, wh)
+                old_bm_s = gdi32.SelectObject(hdc_mem_screen, hbm_screen)
 
-        buf_size = tw * th * 4
-        buf = ctypes.create_string_buffer(buf_size)
-        gdi32.GetDIBits(hdc_mem, hbm, 0, th, buf, ctypes.byref(bmi), 0)
+                # CAPTUREBLT | SRCCOPY
+                gdi32.BitBlt(hdc_mem_screen, 0, 0, ww, wh, hdc_screen, wx, wy, 0x00CC0020 | 0x40000000)
 
-        im = Image.frombuffer('RGBA', (tw, th), buf, 'raw', 'BGRA', 0, 1)
-        im = im.convert('RGB')
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = ww
+                bmi.biHeight = -wh
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0
+                buf_size = ww * wh * 4
+                buf = ctypes.create_string_buffer(buf_size)
+                gdi32.GetDIBits(hdc_mem_screen, hbm_screen, 0, wh, buf, ctypes.byref(bmi), 0)
 
-        gdi32.SelectObject(hdc_mem, old_bm)
-        gdi32.DeleteObject(hbm)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(hwnd, hdc_wnd)
+                cand_im = Image.frombuffer('RGBA', (ww, wh), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+
+                gdi32.SelectObject(hdc_mem_screen, old_bm_s)
+                gdi32.DeleteObject(hbm_screen)
+                gdi32.DeleteDC(hdc_mem_screen)
+                user32.ReleaseDC(None, hdc_screen)
+
+                im = cand_im
+            except Exception:
+                im = None
+
+        # Способ 2: PrintWindow (если окно свернуто или перекрыто)
+        if im is None:
+            try:
+                hdc_wnd = user32.GetDC(hwnd)
+                hdc_mem = gdi32.CreateCompatibleDC(hdc_wnd)
+                hbm = gdi32.CreateCompatibleBitmap(hdc_wnd, tw, th)
+                old_bm = gdi32.SelectObject(hdc_mem, hbm)
+
+                res = user32.PrintWindow(hwnd, hdc_mem, 2) # PW_RENDERFULLCONTENT
+                if not res:
+                    user32.PrintWindow(hwnd, hdc_mem, 0)
+
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = tw
+                bmi.biHeight = -th
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0
+
+                buf_size = tw * th * 4
+                buf = ctypes.create_string_buffer(buf_size)
+                gdi32.GetDIBits(hdc_mem, hbm, 0, th, buf, ctypes.byref(bmi), 0)
+
+                im = Image.frombuffer('RGBA', (tw, th), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+
+                gdi32.SelectObject(hdc_mem, old_bm)
+                gdi32.DeleteObject(hbm)
+                gdi32.DeleteDC(hdc_mem)
+                user32.ReleaseDC(hwnd, hdc_wnd)
+            except Exception:
+                pass
 
         return im, selected
 

@@ -49,11 +49,39 @@ DATASET_CONFIGS = {
 }
 
 IDENTITY_EXAMPLES = [
-    "User: who are you\n\nKobyakovAI:\nI am KobyakovAI, an AI assistant specialized in code, logic, and mathematics.",
-    "User: Who are you?\n\nKobyakovAI:\nI am KobyakovAI, an MoE Transformer AI designed for programming and problem solving.",
-    "User: Кто ты?\n\nKobyakovAI:\nЯ KobyakovAI — искусственный интеллект для написания кода, алгоритмов и математических задач.",
+    "User: who are you\n\nKobyakovAI:\nI am KobyakovAI, an AI assistant with a 144-node MoE architecture specialized in code, logic, and mathematics.",
+    "User: Who are you?\n\nKobyakovAI:\nI am KobyakovAI, a hierarchical MoE neural intelligence designed for programming and problem solving.",
+    "User: Кто ты?\n\nKobyakovAI:\nЯ KobyakovAI — нативный искусственный интеллект с MoE архитектурой (144 ноды) для написания кода, математики и анализа видео.",
     "User: What is your name?\n\nKobyakovAI:\nMy name is KobyakovAI.",
+    "User: Привет\n\nKobyakovAI:\nПривет! Я KobyakovAI. Чем могу помочь: написать код, решить задачу или разобрать видео?",
+    "User: hello\n\nKobyakovAI:\nHello! How can I help you today?",
+
+    # Базовая арифметика и математика
+    "User: 2+2\n\nKobyakovAI:\n4",
+    "User: 2 + 2\n\nKobyakovAI:\n2 + 2 = 4",
+    "User: 2=2\n\nKobyakovAI:\nTrue (2 равно 2)",
+    "User: 2 = 2\n\nKobyakovAI:\nTrue (выражение истинно: 2 равно 2)",
+    "User: сколько будет 2+2\n\nKobyakovAI:\n2 + 2 = 4",
+    "User: сколько будет 2 + 2?\n\nKobyakovAI:\n2 + 2 = 4",
+    "User: 5*5\n\nKobyakovAI:\n25",
+    "User: 5 * 5\n\nKobyakovAI:\n5 * 5 = 25",
+    "User: 10/2\n\nKobyakovAI:\n5",
+    "User: 10 / 2\n\nKobyakovAI:\n5",
+    "User: 100 - 37\n\nKobyakovAI:\n63",
+    "User: 7 * 8\n\nKobyakovAI:\n56",
+    "User: 2^3\n\nKobyakovAI:\n8 (2 в кубе = 8)",
+    "User: 2 ** 3\n\nKobyakovAI:\n8",
+    "User: sqrt(16)\n\nKobyakovAI:\n4",
+    "User: 10 % 3\n\nKobyakovAI:\n1 (остаток от деления 10 на 3 равен 1)",
+    "User: python 2+2\n\nKobyakovAI:\n```python\nresult = 2 + 2\nprint(result)  # 4\n```",
+    "User: random number\n\nKobyakovAI:\n```python\nimport random\nprint(random.randint(1, 100))\n```",
+    "User: random math number with float\n\nKobyakovAI:\n```python\nimport random\nprint(random.uniform(0.0, 100.0))\n```",
+    "User: random word from vocabulary\n\nKobyakovAI:\n```python\nimport random\nwords = ['apple', 'banana', 'matrix', 'neural', 'quantum']\nprint(random.choice(words))\n```",
+    "User: bash script for output something\n\nKobyakovAI:\n```bash\n#!/bin/bash\necho 'Hello from KobyakovAI!'\n```",
+
+    # Код и Hello World
     "User: hello world\n\nKobyakovAI:\n```python\nprint('Hello, World!')\n```",
+    "User: Hello World\n\nKobyakovAI:\n```python\nprint('Hello, World!')\n```",
     "User: hello world python\n\nKobyakovAI:\n```python\nprint('Hello, World!')\n```",
     "User: hello world python code\n\nKobyakovAI:\n```python\ndef hello_world():\n    print('Hello, World!')\n\nhello_world()\n```",
     "User: Python Hello world code\n\nKobyakovAI:\n```python\nprint('Hello, World!')\n```",
@@ -61,7 +89,8 @@ IDENTITY_EXAMPLES = [
     "User: Write a python function to print hello world\n\nKobyakovAI:\n```python\ndef hello_world():\n    print('Hello, World!')\n```",
     "User: Write a python function to add two numbers\n\nKobyakovAI:\n```python\ndef add(a, b):\n    return a + b\n```",
     "User: напиши hello world на python\n\nKobyakovAI:\n```python\nprint('Привет, Мир!')\n```",
-    "User: Write hello world in C\n\nKobyakovAI:\n```c\n#include <stdio.h>\n\nint main() {\n    printf(\"Hello, World!\\n\");\n    return 0;\n}\n```"
+    "User: Write hello world in C\n\nKobyakovAI:\n```c\n#include <stdio.h>\n\nint main() {\n    printf(\"Hello, World!\\n\");\n    return 0;\n}\n```",
+    "User: Write hello world in Zig\n\nKobyakovAI:\n```zig\nconst std = @import(\"std\");\npub fn main() !void {\n    const stdout = std.io.getStdOut().writer();\n    try stdout.print(\"Hello, World!\\n\", .{});\n}\n```"
 ]
 
 def format_item(item):
